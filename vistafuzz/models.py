@@ -16,6 +16,7 @@ KINDS = (
     "dict",
     "callable",
     "device",
+    "receiver",
     "unknown",
 )
 
@@ -23,6 +24,16 @@ REL_SHAPE_FOLLOWS = "shape_follows"
 REL_AXIS_OF = "axis_of"
 REL_DTYPE_FOLLOWS = "dtype_follows"
 SUPPORTED_RELATIONSHIPS = (REL_SHAPE_FOLLOWS, REL_AXIS_OF, REL_DTYPE_FOLLOWS)
+
+INT_NAMES = frozenset({
+    "year", "month", "day", "hour", "minute", "second", "microsecond",
+    "millisecond", "week", "weekday", "n", "k", "m", "size", "count", "num",
+    "number", "index", "idx", "length", "width", "height", "rows", "cols",
+    "columns", "ndim", "digits", "precision", "denominator", "numerator",
+    "repeats", "times", "steps", "iterations", "bins", "degree", "order",
+    "radix", "base", "offset", "start", "stop", "step", "maxlen", "capacity",
+    "max_denominator", "decimals", "nbytes", "period", "periods", "window",
+})
 
 CALL_POSITIONAL = "positional"
 CALL_POSITIONAL_OR_KEYWORD = "positional_or_keyword"
@@ -102,6 +113,9 @@ class ApiSpec:
     params: list[ParamSpec] = field(default_factory=list)
     extractor: str = ""
     notes: list[str] = field(default_factory=list)
+    is_method: bool = False
+    receiver_path: str = ""
+    receiver_params: list[ParamSpec] = field(default_factory=list)
 
     def param(self, name: str) -> ParamSpec | None:
         for p in self.params:
@@ -117,6 +131,9 @@ class ApiSpec:
             "extractor": self.extractor,
             "notes": list(self.notes),
             "params": [p.to_json() for p in self.params],
+            "is_method": self.is_method,
+            "receiver_path": self.receiver_path,
+            "receiver_params": [p.to_json() for p in self.receiver_params],
         }
 
     @classmethod
@@ -128,6 +145,10 @@ class ApiSpec:
             extractor=data.get("extractor", ""),
             notes=list(data.get("notes", [])),
             params=[ParamSpec.from_json(p) for p in data.get("params", [])],
+            is_method=bool(data.get("is_method", False)),
+            receiver_path=data.get("receiver_path", ""),
+            receiver_params=[ParamSpec.from_json(p)
+                             for p in data.get("receiver_params", [])],
         )
 
 
@@ -163,6 +184,9 @@ class Finding:
     args: dict[str, Any] = field(default_factory=dict)
     order: list[str] = field(default_factory=list)
     strategy: str = ""
+    receiver_path: str = ""
+    receiver_args: dict[str, Any] = field(default_factory=dict)
+    receiver_order: list[str] = field(default_factory=list)
 
     def to_json(self) -> dict[str, Any]:
         return asdict(self)

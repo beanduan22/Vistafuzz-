@@ -31,6 +31,7 @@ class RunConfig:
     max_depth: int = 3
     include: str = ""
     numeric_only: bool = True
+    methods: bool = True
     apis: list[str] = field(default_factory=list)
     save_reproducers: bool = True
     llm: llm_mod.LLMConfig | None = None
@@ -70,10 +71,10 @@ def _events(path: str) -> Iterable[dict[str, Any]]:
     return rows
 
 
-def _mark_keyword_flags(args: dict[str, Any], spec: ApiSpec) -> dict[str, Any]:
+def _mark_keyword_flags(args: dict[str, Any], params: list[Any]) -> dict[str, Any]:
     out = {}
     keyword_from_here = False
-    ordered = sorted(spec.params, key=lambda p: (p.position if p.position is not None else 1 << 20))
+    ordered = sorted(params, key=lambda p: (p.position if p.position is not None else 1 << 20))
     for param in ordered:
         described = args.get(param.name)
         if described is None or described.get("omitted"):
@@ -86,9 +87,21 @@ def _mark_keyword_flags(args: dict[str, Any], spec: ApiSpec) -> dict[str, Any]:
     return out
 
 
-def _order(spec: ApiSpec) -> list[str]:
-    return [p.name for p in sorted(spec.params,
+def _order(params: list[Any]) -> list[str]:
+    return [p.name for p in sorted(params,
                                    key=lambda p: (p.position if p.position is not None else 1 << 20))]
+
+
+def _finding(api: str, spec: ApiSpec, row: dict[str, Any]) -> Finding:
+    return Finding(
+        api=api, oracle=row.get("oracle", ""), kind=row.get("kind", ""),
+        detail=row.get("detail", ""),
+        args=_mark_keyword_flags(row.get("args", {}), spec.params),
+        order=_order(spec.params), strategy=row.get("strategy", ""),
+        receiver_path=spec.receiver_path,
+        receiver_args=_mark_keyword_flags(row.get("receiver_args", {}),
+                                          spec.receiver_params),
+        receiver_order=_order(spec.receiver_params))
 
 
 def run_api(record: ApiRecord, config: RunConfig, work_dir: str) -> ApiOutcome:
@@ -146,11 +159,7 @@ def run_api(record: ApiRecord, config: RunConfig, work_dir: str) -> ApiOutcome:
                 outcome.rejected += 1
             oracle = row.get("oracle")
             if oracle:
-                args = _mark_keyword_flags(row.get("args", {}), spec)
-                outcome.findings.append(Finding(
-                    api=record.api, oracle=oracle, kind=row.get("kind", ""),
-                    detail=row.get("detail", ""), args=args, order=_order(spec),
-                    strategy=row.get("strategy", "")))
+                outcome.findings.append(_finding(record.api, spec, row))
         elif event == "api_done":
             outcome.cases = int(row.get("cases", outcome.cases))
             outcome.oracle_hits = int(row.get("oracle_hits", 0))
@@ -162,12 +171,11 @@ def run_api(record: ApiRecord, config: RunConfig, work_dir: str) -> ApiOutcome:
         pass
     elif verdict and pending_start is not None:
         kind, detail = verdict
-        args = _mark_keyword_flags(pending_start.get("args", {}), spec)
         tail = stderr.strip().splitlines()[-3:]
-        outcome.findings.append(Finding(
-            api=record.api, oracle="crash", kind=kind,
-            detail=detail + (("\n" + "\n".join(tail)) if tail else ""),
-            args=args, order=_order(spec)))
+        row = dict(pending_start)
+        row.update({"oracle": "crash", "kind": kind,
+                    "detail": detail + (("\n" + "\n".join(tail)) if tail else "")})
+        outcome.findings.append(_finding(record.api, spec, row))
     elif verdict and pending_start is None and not rows:
         outcome.status = "error"
         outcome.reason = f"worker failed before any case ({verdict[1]})"
@@ -185,7 +193,8 @@ def run(config: RunConfig) -> dict[str, Any]:
         records = [r for r in (collect_api(a) for a in config.apis) if r is not None]
     else:
         records = collect(config.lib, max_depth=config.max_depth, limit=config.max_apis,
-                          numeric_only=config.numeric_only, include=config.include)
+                          numeric_only=config.numeric_only, include=config.include,
+                          methods=config.methods)
 
     started = time.time()
     outcomes: list[ApiOutcome] = []
@@ -221,6 +230,7 @@ def run(config: RunConfig) -> dict[str, Any]:
         "extractor": config.extractor,
         "budget_sec_per_api": config.budget_sec,
         "apis_discovered": len(records),
+        "apis_method_based": len([r for r in records if r.is_method]),
         "apis_tested": len(tested),
         "apis_covered": len([o for o in tested if o.executed > 0]),
         "apis_excluded": len([o for o in outcomes if o.status == "excluded"]),

@@ -10,8 +10,8 @@ import traceback
 from typing import Any
 
 from . import generation, oracles
-from .collector import collect_api
-from .constraints import initialize
+from .collector import collect_api, resolve
+from .constraints import DATA_LIKE_NAMES, envelope_for, initialize
 from .materialize import materialize
 from .models import ApiSpec, Value
 
@@ -53,6 +53,68 @@ def _finding_key(oracle: str, kind: str, args: dict[str, Any]) -> tuple:
     return (oracle, kind, signature)
 
 
+def _receiver_args(spec: ApiSpec, rng: random.Random,
+                   seed: int) -> dict[str, Value]:
+    args: dict[str, Value] = {}
+    for idx, param in enumerate(spec.receiver_params):
+        if param.call_kind in ("var_positional", "var_keyword"):
+            continue
+        optional = not param.required and param.has_default
+        if optional and param.name.lower() not in DATA_LIKE_NAMES and rng.random() > 0.35:
+            args[param.name] = Value(kind="default", payload=param.default, omitted=True,
+                                     recipe={"form": "const", "value": param.default},
+                                     strategy="default")
+            continue
+        env = envelope_for(param)
+        variants = generation.derive_variants(param, args)
+        if variants:
+            strategy = generation.select_strategy(rng, variants)
+            value = generation.generate(param, args, variants, strategy, rng)
+        else:
+            value = generation.make_value(param, env, args, seed=seed * 131 + idx)
+        if value is None:
+            value = Value(kind="default", payload=param.default, omitted=True,
+                          recipe={"form": "const", "value": param.default})
+        args[param.name] = value
+    return args
+
+
+def _receiver_typed(param: Any, class_name: str, signature_text: str) -> bool:
+    short = class_name.rsplit(".", 1)[-1].lower()
+    if len(short) < 3:
+        return False
+    if short in (param.doc or "").lower():
+        return True
+    return f"{param.name}: {short}" in (signature_text or "").lower()
+
+
+RECEIVER_ATTEMPTS = 6
+
+
+def _build_receiver(cls: Any, spec: ApiSpec, args: dict[str, Value]) -> Any:
+    positional, keyword = materialize(spec.receiver_path, spec.receiver_params, args)
+    try:
+        return cls(*positional, **keyword)
+    except Exception:
+        return None
+
+
+def _make_receiver(cls: Any, spec: ApiSpec, rng: random.Random,
+                   seed: int) -> tuple[Any, dict[str, Value]]:
+    for attempt in range(RECEIVER_ATTEMPTS):
+        args = _receiver_args(spec, rng, seed + attempt * 7919)
+        try:
+            instance = _build_receiver(cls, spec, args)
+        except Exception:
+            instance = None
+        if instance is not None:
+            return instance, args
+    try:
+        return cls(), {}
+    except Exception:
+        return None, {}
+
+
 def _preview(obj: Any, limit: int = 160) -> str:
     try:
         text = repr(obj)
@@ -76,9 +138,16 @@ def run_job(job: dict[str, Any]) -> int:
         log.close()
         return 0
     target = record.obj
+    method_name = api.rsplit(".", 1)[1] if spec.is_method else ""
+    receiver_cls = resolve(spec.receiver_path) if spec.is_method else None
+    if spec.is_method and receiver_cls is None:
+        log.write({"event": "skip", "api": api,
+                   "reason": f"receiver class {spec.receiver_path} not resolvable"})
+        log.close()
+        return 0
 
     seed_args = initialize(spec.params, seed=job.get("seed", 0))
-    if not seed_args and any(p.required for p in spec.params):
+    if not seed_args and any(p.required for p in spec.params) and not spec.is_method:
         log.write({"event": "skip", "api": api,
                    "reason": "no supported value for a required parameter"})
         log.close()
@@ -125,8 +194,45 @@ def run_job(job: dict[str, Any]) -> int:
                        "detail": f"{type(exc).__name__}: {exc}"})
             continue
 
+        receiver_described: dict[str, Any] = {}
+        bound = target
+        if spec.is_method:
+            instance, recv_args = _make_receiver(receiver_cls, spec, rng, cases)
+            receiver_described = _describe(recv_args)
+            if instance is None:
+                log.write({"event": "result", "case": cases, "status": "rejected",
+                           "detail": f"could not construct {spec.receiver_path}"})
+                continue
+            bound = getattr(instance, method_name, None)
+            if not callable(bound):
+                log.write({"event": "result", "case": cases, "status": "rejected",
+                           "detail": f"{method_name} unavailable on the constructed receiver"})
+                continue
+            for param in spec.params:
+                if param.name not in new_args or new_args[param.name].omitted:
+                    continue
+                typed = _receiver_typed(param, spec.receiver_path, spec.signature_text)
+                if not typed and not (param.required and rng.random() < 0.5):
+                    continue
+                peer, peer_args = _make_receiver(receiver_cls, spec, rng,
+                                                 cases + 104729)
+                if peer is None:
+                    continue
+                new_args[param.name] = Value(
+                    kind="receiver", payload=peer,
+                    recipe={"form": "receiver", "path": spec.receiver_path,
+                            "args": {k: v.describe() for k, v in peer_args.items()}},
+                    strategy="receiver")
+            try:
+                positional, keyword = materialize(api, spec.params, new_args)
+            except Exception as exc:
+                log.write({"event": "result", "case": cases, "status": "unmaterializable",
+                           "detail": f"{type(exc).__name__}: {exc}"})
+                continue
+
         described = _describe(new_args)
         log.write({"event": "start", "case": cases, "args": described,
+                   "receiver_args": receiver_described,
                    "n_positional": len(positional), "keywords": sorted(keyword)})
 
         finite_inputs = oracles.inputs_are_finite(list(positional) + list(keyword.values()))
@@ -134,7 +240,7 @@ def run_job(job: dict[str, Any]) -> int:
         if hasattr(signal, "SIGALRM"):
             signal.alarm(case_timeout)
         try:
-            result = target(*positional, **keyword)
+            result = bound(*positional, **keyword)
             status, detail = "executed", ""
         except _Timeout:
             oracle_hits += 1
@@ -144,7 +250,8 @@ def run_job(job: dict[str, Any]) -> int:
             event = {"event": "result", "case": cases, "status": "hang",
                      "detail": f"exceeded {case_timeout}s"}
             if report:
-                event.update({"oracle": "crash", "kind": "hang", "args": described})
+                event.update({"oracle": "crash", "kind": "hang", "args": described,
+                              "receiver_args": receiver_described})
             log.write(event)
             continue
         except BaseException as exc:
@@ -168,7 +275,8 @@ def run_job(job: dict[str, Any]) -> int:
             event["detail"] = detail
             key = _finding_key("crash", "exception", described)
             if key not in seen_findings and len(seen_findings) < max_findings:
-                event.update({"oracle": "crash", "kind": "exception", "args": described})
+                event.update({"oracle": "crash", "kind": "exception", "args": described,
+                              "receiver_args": receiver_described})
             seen_findings.add(key)
         elif status == "rejected":
             event["detail"] = detail

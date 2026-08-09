@@ -174,20 +174,6 @@ Findings are deduplicated per API by (oracle, failure kind, per-parameter value
 pattern/dtype/rank) and capped by `--max-findings-per-api` (default 5), so one
 systematic failure does not produce thousands of rows.
 
-### Excluded APIs
-
-Applied during discovery and validation: no documentation or signature; external
-files, devices, sessions or graphs; no measurable output (printing, plotting,
-logging); strong inter-API dependencies; more than eight required parameters.
-
-Name matching works on the **tokens** of an API name (snake_case *and* camelCase
-are split), never on raw substrings — otherwise the rule that removes logging
-and tracing helpers would also remove `numpy.log`, `numpy.logaddexp` and
-`numpy.trace`. A short list of glued IO names (`imread`, `savetxt`, …) is matched
-as substrings because they never split into tokens.
-Optional `out=`, `device=`, `session=`, `where=`-style parameters always keep
-their documented default — `where=` is included because a ufunc leaves skipped
-elements uninitialized, which the NaN oracle would otherwise read.
 
 ## 6. Useful flags
 
@@ -216,40 +202,3 @@ variant derivation, all three relationship resolutions, recipe determinism,
 materialization, oracle classification, and an end-to-end run with reproducer
 execution.
 
-## 8. Layout
-
-```
-Vistafuzz-/
-├── vistafuzz/
-│   ├── collector.py      # information collection + API discovery
-│   ├── prompt.py         # four-part extraction prompt
-│   ├── llm.py            # Ollama / OpenAI-compatible client (temperature 0)
-│   ├── extraction.py     # LLM extraction + offline fallback
-│   ├── validation.py     # runtime-signature validation
-│   ├── models.py         # ParamSpec / ApiSpec / Value / Finding
-│   ├── constraints.py    # individual constraints, envelopes, initialization
-│   ├── relationships.py  # the three executable relationship forms
-│   ├── generation.py     # type / size / value strategies
-│   ├── synth.py          # deterministic value synthesis (embedded in reproducers)
-│   ├── materialize.py    # library-native runtime objects
-│   ├── oracles.py        # crash + NaN
-│   ├── worker.py         # isolated per-API executor
-│   ├── runner.py         # Algorithm 1, parent side
-│   ├── reproducer.py     # standalone reproducer emission
-│   └── cli.py            # command-line interface
-├── examples/run_examples.sh
-├── tests/test_pipeline.py
-└── pyproject.toml
-```
-
-## 9. Known limitations
-
-* Only the three normalized relationship forms are enforced; other documented
-  dependencies are recorded but not executed.
-* The NaN oracle's domain check is an approximation (finite inputs + extracted
-  constraints); an API whose documentation does not state its domain can produce
-  false positives, which is why extraction quality directly affects precision.
-* Generation is single-process per API; there is no cross-API state or sequence
-  fuzzing.
-* Discovery walks module attributes, so APIs reachable only through class
-  instances are not collected.

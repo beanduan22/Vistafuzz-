@@ -16,9 +16,11 @@ def make_value(spec: ParamSpec, env: Envelope, args: dict[str, Value], *,
                seed: int, dtype: str | None = None,
                shape: tuple[int, ...] | None = None,
                pattern: str | None = None, const: Any = None,
+               kind: str | None = None,
                strategy: str = "init") -> Value | None:
     overrides = relationships.apply(spec, args)
-    kind = env.kinds[0] if env.kinds else "array"
+    if kind is None or kind not in env.kinds:
+        kind = env.kinds[0] if env.kinds else "array"
 
     if const is not None or kind in ("bool", "str") or (env.enum_values and kind != "dtype"):
         value = const
@@ -93,6 +95,9 @@ def derive_variants(spec: ParamSpec, args: dict[str, Value]) -> list[dict[str, A
     if env.enum_values:
         variants += [{"strategy": "value", "const": v} for v in env.enum_values[:8]]
 
+    if len(env.kinds) > 1:
+        variants += [{"strategy": "type", "kind": k} for k in env.kinds]
+
     if "dtype" not in overrides:
         for dtype in env.dtypes[:4]:
             variants.append({"strategy": "type", "dtype": dtype})
@@ -136,7 +141,7 @@ def generate(spec: ParamSpec, args: dict[str, Value], variants: list[dict[str, A
     return make_value(spec, env, args, seed=seed,
                       dtype=choice.get("dtype"), shape=choice.get("shape"),
                       pattern=choice.get("pattern"), const=choice.get("const"),
-                      strategy=strategy)
+                      kind=choice.get("kind"), strategy=strategy)
 
 
 def refresh_dependents(specs: list[ParamSpec], args: dict[str, Value],

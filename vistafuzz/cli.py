@@ -33,9 +33,11 @@ def _add_llm_flags(parser: argparse.ArgumentParser) -> None:
 
 def cmd_apis(args: argparse.Namespace) -> int:
     records = collect(args.lib, max_depth=args.max_depth, limit=args.limit,
-                      numeric_only=not args.all, include=args.include)
+                      numeric_only=not args.all, include=args.include,
+                      methods=not args.no_methods)
     for record in records:
-        print(f"{record.api}{record.signature_text}")
+        marker = "  [method]" if record.is_method else ""
+        print(f"{record.api}{record.signature_text}{marker}")
     print(f"\n{len(records)} API(s) discovered in {args.lib}", file=sys.stderr)
     return 0
 
@@ -79,6 +81,7 @@ def cmd_fuzz(args: argparse.Namespace) -> int:
         max_depth=args.max_depth,
         include=args.include,
         numeric_only=not args.all,
+        methods=not args.no_methods,
         apis=list(args.api or []),
         save_reproducers=not args.no_reproducers,
         llm=_llm_config(args),
@@ -119,6 +122,8 @@ def build_parser() -> argparse.ArgumentParser:
     apis.add_argument("--limit", type=int, default=None)
     apis.add_argument("--include", default="", help="regex filter on the API path")
     apis.add_argument("--all", action="store_true", help="skip the numeric-API filter")
+    apis.add_argument("--no-methods", action="store_true",
+                      help="only module-level functions; skip class methods")
     apis.set_defaults(func=cmd_apis)
 
     ext = sub.add_parser("extract", help="extract and validate one API's ParamSpecs")
@@ -143,6 +148,8 @@ def build_parser() -> argparse.ArgumentParser:
     fuzz.add_argument("--max-depth", type=int, default=3)
     fuzz.add_argument("--include", default="")
     fuzz.add_argument("--all", action="store_true")
+    fuzz.add_argument("--no-methods", action="store_true",
+                      help="only module-level functions; skip class methods")
     fuzz.add_argument("--no-reproducers", action="store_true")
     _add_llm_flags(fuzz)
     fuzz.set_defaults(func=cmd_fuzz)

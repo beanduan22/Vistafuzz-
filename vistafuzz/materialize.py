@@ -74,6 +74,8 @@ def materialize_value(root: str, value: Value) -> Any:
     if value.kind == "dtype":
         native = native_dtype(root, str(value.payload))
         return native if native is not None else value.payload
+    if value.kind == "receiver":
+        return value.payload
     if value.kind in ("shape",):
         return tuple(value.payload)
     if value.kind in ("sequence",):

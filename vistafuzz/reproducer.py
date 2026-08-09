@@ -26,6 +26,8 @@ API = {api!r}
 ARGS = {args!r}
 ORACLE = {oracle!r}
 KIND = {kind!r}
+RECEIVER_PATH = {receiver_path!r}
+RECEIVER_ARGS = {receiver_args!r}
 
 
 def _resolve(path):
@@ -96,17 +98,45 @@ def _iter_numeric(obj, depth=0):
                 return
 
 
+def _build_args(entries, root):
+    positional, keyword = [], {{}}
+    for entry in entries:
+        recipe = entry["recipe"] or {{}}
+        if recipe.get("form") == "receiver":
+            value = _build_receiver(recipe.get("path", RECEIVER_PATH),
+                                    list(recipe.get("args", {{}}).values()), root)
+        else:
+            value = _native(root, build_value(recipe) if recipe else None,
+                            entry.get("dtype"))
+        if entry["by_keyword"]:
+            keyword[entry["name"]] = value
+        else:
+            positional.append(value)
+    return positional, keyword
+
+
+def _build_receiver(path, described_args, root):
+    cls = _resolve(path)
+    entries = [{{"name": d.get("name", ""), "recipe": d.get("recipe") or {{}},
+                "dtype": d.get("dtype"), "by_keyword": bool(d.get("by_keyword"))}}
+               for d in described_args if not d.get("omitted")]
+    positional, keyword = _build_args(entries, root)
+    try:
+        return cls(*positional, **keyword)
+    except Exception:
+        return cls()
+
+
 def main() -> int:
     root = API.split(".", 1)[0]
-    fn = _resolve(API)
-    positional, keyword = [], {{}}
-    for entry in ARGS:
-        value = build_value(entry["recipe"]) if entry["recipe"] else None
-        native = _native(root, value, entry.get("dtype"))
-        if entry["by_keyword"]:
-            keyword[entry["name"]] = native
-        else:
-            positional.append(native)
+    positional, keyword = _build_args(ARGS, root)
+
+    if RECEIVER_PATH:
+        instance = _build_receiver(RECEIVER_PATH, RECEIVER_ARGS, root)
+        fn = getattr(instance, API.rsplit(".", 1)[1])
+        print(f"receiver: {{RECEIVER_PATH}} -> {{instance!r}}"[:200])
+    else:
+        fn = _resolve(API)
 
     print(f"calling {{API}} with {{len(positional)}} positional and {{sorted(keyword)}} keyword args")
     if ORACLE == "crash":
@@ -131,10 +161,10 @@ if __name__ == "__main__":
 '''
 
 
-def _arg_entries(finding: Finding) -> list[dict[str, Any]]:
+def _entries(order: list[str], args: dict[str, Any]) -> list[dict[str, Any]]:
     entries: list[dict[str, Any]] = []
-    for name in finding.order:
-        described = finding.args.get(name)
+    for name in order:
+        described = args.get(name)
         if not described or described.get("omitted"):
             continue
         entries.append({
@@ -146,6 +176,14 @@ def _arg_entries(finding: Finding) -> list[dict[str, Any]]:
     return entries
 
 
+def _arg_entries(finding: Finding) -> list[dict[str, Any]]:
+    return _entries(finding.order, finding.args)
+
+
+def _receiver_entries(finding: Finding) -> list[dict[str, Any]]:
+    return _entries(finding.receiver_order, finding.receiver_args)
+
+
 def render(finding: Finding) -> str:
     body = inspect.getsource(synth).lstrip("\n")
     body = body.replace("from __future__ import annotations\n", "")
@@ -153,7 +191,10 @@ def render(finding: Finding) -> str:
     header = _HEADER.format(api=finding.api, oracle=finding.oracle,
                             kind=finding.kind, detail=finding.detail.strip()[:600])
     footer = _FOOTER.format(api=finding.api, args=_arg_entries(finding),
-                            oracle=finding.oracle, kind=finding.kind)
+                            oracle=finding.oracle, kind=finding.kind,
+                            receiver_path=finding.receiver_path,
+                            receiver_args=_receiver_entries(finding)
+                            if finding.receiver_path else [])
     return header + body + footer
 
 

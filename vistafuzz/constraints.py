@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from . import synth
-from .models import ParamSpec, Value
+from .models import INT_NAMES, ParamSpec, Value
 
 FLOAT_DTYPES = ("float64", "float32", "float16")
 INT_DTYPES = ("int64", "int32", "int16", "uint8")
@@ -19,6 +19,13 @@ _IMAGE_HINTS = ("image", "img", "src", "dst", "frame", "picture", "photo",
 
 NEVER_SYNTHESIZED = frozenset({"out", "output", "device", "stream", "session",
                                "graph", "ctx", "context", "handle", "sess", "where"})
+
+UNKNOWN_KINDS = ("array", "int", "number", "str", "bool")
+
+
+DATA_LIKE_NAMES = frozenset({"data", "values", "value", "x", "a", "arr", "array",
+                             "input", "obj", "object", "seq", "iterable", "numerator",
+                             "buffer", "content", "items", "elements"})
 
 
 def keeps_default(spec: ParamSpec) -> bool:
@@ -82,7 +89,8 @@ def envelope_for(spec: ParamSpec) -> Envelope:
     env = Envelope(low=low, high=high, allow_nonfinite=allow_nonfinite,
                    omittable=not spec.required and spec.has_default)
     kind = spec.kind if spec.kind != "unknown" else _guess_kind(spec)
-    env.kinds = [kind]
+    env.kinds = [kind] if kind != "unknown" else list(UNKNOWN_KINDS)
+    kind = env.kinds[0]
     env.enum_values = list(spec.enum_values or [])
 
     if kind == "array":
@@ -134,7 +142,9 @@ def _guess_kind(spec: ParamSpec) -> str:
         return "axis"
     if name in ("dtype", "type"):
         return "dtype"
-    return "array"
+    if name in INT_NAMES:
+        return "int"
+    return "unknown"
 
 
 def initialize(specs: list[ParamSpec], seed: int = 0) -> dict[str, Value]:

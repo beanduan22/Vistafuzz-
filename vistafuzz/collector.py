@@ -55,6 +55,22 @@ class ApiRecord:
     signature_text: str
     signature: inspect.Signature | None
     module: str
+    is_method: bool = False
+    cls: Any = None
+    class_path: str = ""
+    receiver_doc: str = ""
+    receiver_signature_text: str = ""
+    receiver_signature: "inspect.Signature | None" = None
+
+
+def receiver_record(record: "ApiRecord") -> "ApiRecord | None":
+    if not record.is_method or record.cls is None:
+        return None
+    return ApiRecord(api=record.class_path, obj=record.cls,
+                     doc=record.receiver_doc,
+                     signature_text=record.receiver_signature_text,
+                     signature=record.receiver_signature,
+                     module=record.class_path.rsplit(".", 1)[0])
 
 
 def _iter_modules(root: str, max_depth: int) -> Iterator[str]:
@@ -233,11 +249,15 @@ def collect_api(api: str) -> ApiRecord | None:
     obj = resolve(api)
     if obj is None or not callable(obj):
         return None
+    owner_path = api.rsplit(".", 1)[0]
+    owner = resolve(owner_path) if "." in api else None
+    if isinstance(owner, type):
+        return _method_record(owner_path.rsplit(".", 1)[0], owner, owner_path,
+                              api.rsplit(".", 1)[1], obj)
     doc = inspect.getdoc(obj) or ""
     sig_text, sig = describe(obj)
-    module = api.rsplit(".", 1)[0]
     return ApiRecord(api=api, obj=obj, doc=doc, signature_text=sig_text,
-                     signature=sig, module=module)
+                     signature=sig, module=owner_path)
 
 
 def resolve(path: str) -> Any:
@@ -267,9 +287,86 @@ def resolve(path: str) -> Any:
     return obj
 
 
+_MAX_RECEIVER_ARGS = 6
+_NO_DIRECT_CONSTRUCTION = re.compile(
+    r"should be constructed using|do not (?:instantiate|construct)|"
+    r"not intended to be (?:instantiated|constructed)|"
+    r"use the .{0,40} (?:function|factory) instead|"
+    r"cannot be instantiated directly", re.I)
+
+
+def _class_is_testable(cls: Any, name: str) -> bool:
+    if name.startswith("_") or _is_excluded_name(name):
+        return False
+    if not isinstance(cls, type):
+        return False
+    if issubclass(cls, BaseException):
+        return False
+    if getattr(cls, "__abstractmethods__", None):
+        return False
+    if issubclass(cls, type):
+        return False
+    doc = inspect.getdoc(cls) or ""
+    if not doc:
+        return False
+    if _NO_DIRECT_CONSTRUCTION.search(doc[:600]):
+        return False
+    ctor_text, ctor_sig = describe(cls)
+    if ctor_sig is not None:
+        required = [p for p in ctor_sig.parameters.values()
+                    if p.default is inspect.Parameter.empty
+                    and p.kind not in (inspect.Parameter.VAR_POSITIONAL,
+                                       inspect.Parameter.VAR_KEYWORD)]
+        if len(required) > _MAX_RECEIVER_ARGS:
+            return False
+    elif not ctor_text:
+        return False
+    return True
+
+
+def _method_record(module: str, cls: Any, class_path: str, name: str,
+                   fn: Any) -> "ApiRecord | None":
+    doc = inspect.getdoc(fn) or ""
+    sig_text, sig = describe(fn)
+    if not doc or not sig_text:
+        return None
+    ctor_text, ctor_sig = describe(cls)
+    return ApiRecord(api=f"{class_path}.{name}", obj=fn, doc=doc,
+                     signature_text=sig_text, signature=sig, module=module,
+                     is_method=True, cls=cls, class_path=class_path,
+                     receiver_doc=inspect.getdoc(cls) or "",
+                     receiver_signature_text=ctor_text,
+                     receiver_signature=ctor_sig)
+
+
+def _iter_class_methods(module: str, cls: Any, class_path: str,
+                        include: "re.Pattern | None") -> "Iterator[ApiRecord]":
+    for name in sorted(dir(cls)):
+        if name.startswith("_") or _is_excluded_name(name):
+            continue
+        try:
+            static = inspect.getattr_static(cls, name)
+        except AttributeError:
+            continue
+        if isinstance(static, (property, staticmethod, classmethod)):
+            continue
+        try:
+            fn = inspect.getattr_static(cls, name)
+        except AttributeError:
+            continue
+        if not callable(fn):
+            continue
+        qualname = f"{class_path}.{name}"
+        if include and not include.search(qualname):
+            continue
+        record = _method_record(module, cls, class_path, name, fn)
+        if record is not None:
+            yield record
+
+
 def collect(lib: str, *, max_depth: int = 3, limit: int | None = None,
             numeric_only: bool = True, include: str = "",
-            exclude_filters: bool = True) -> list[ApiRecord]:
+            exclude_filters: bool = True, methods: bool = True) -> list[ApiRecord]:
     seen: set[int] = set()
     out: list[ApiRecord] = []
     pattern = re.compile(include) if include else None
@@ -283,6 +380,23 @@ def collect(lib: str, *, max_depth: int = 3, limit: int | None = None,
             if name.startswith("_") or not callable(obj):
                 continue
             if isinstance(obj, type):
+                if not methods or id(obj) in seen:
+                    continue
+                owner_mod = getattr(obj, "__module__", "") or ""
+                if owner_mod and owner_mod.split(".")[0] != lib.split(".")[0]:
+                    continue
+                if not _class_is_testable(obj, name):
+                    continue
+                seen.add(id(obj))
+                for record in _iter_class_methods(mod_name, obj,
+                                                  f"{mod_name}.{name}", pattern):
+                    if numeric_only and not _looks_numeric(
+                            record.doc + " " + record.receiver_doc[:600],
+                            record.signature_text):
+                        continue
+                    out.append(record)
+                    if limit and len(out) >= limit:
+                        return out
                 continue
             owner = getattr(obj, "__module__", "") or ""
             if owner and not owner.split(".")[0] == lib.split(".")[0]:

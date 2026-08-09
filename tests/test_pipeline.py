@@ -259,6 +259,70 @@ def test_crash_verdict():
     assert oracles.crash_verdict(0, None, True)[0] == "hang"
 
 
+def test_method_discovery_and_receiver_extraction():
+    from vistafuzz.collector import collect, receiver_record
+    records = collect("decimal", max_depth=1, limit=20)
+    methods = [r for r in records if r.is_method]
+    assert methods, "no class methods discovered"
+    record = methods[0]
+    assert record.class_path.startswith("decimal.")
+    assert receiver_record(record).api == record.class_path
+    spec = extract(record, extractor="signature")
+    assert spec.is_method and spec.receiver_path == record.class_path
+    assert validate(spec, record).ok
+
+
+def test_classes_documented_as_non_constructible_are_skipped():
+    import numpy as np
+    from vistafuzz.collector import _class_is_testable
+    assert not _class_is_testable(np.ndarray, "ndarray")
+    import decimal
+    assert _class_is_testable(decimal.Decimal, "Decimal")
+
+
+def test_zero_argument_method_is_testable():
+    from vistafuzz.collector import collect_api
+    record = collect_api("decimal.Decimal.adjusted")
+    spec = extract(record, extractor="signature")
+    result = validate(spec, record)
+    assert result.ok and result.spec.params == []
+
+
+def test_method_reproducer_rebuilds_the_receiver(tmp_path):
+    from vistafuzz import reproducer
+    from vistafuzz.models import Finding
+    finding = Finding(
+        api="fractions.Fraction.limit_denominator", oracle="crash", kind="exception",
+        detail="synthetic", order=["max_denominator"],
+        args={"max_denominator": {"kind": "int", "dtype": "int64",
+                                  "recipe": {"form": "const", "value": 3},
+                                  "by_keyword": False, "omitted": False}},
+        receiver_path="fractions.Fraction", receiver_order=["numerator", "denominator"],
+        receiver_args={"numerator": {"kind": "int", "dtype": "int64",
+                                     "recipe": {"form": "const", "value": 22},
+                                     "by_keyword": False, "omitted": False},
+                       "denominator": {"kind": "int", "dtype": "int64",
+                                       "recipe": {"form": "const", "value": 7},
+                                       "by_keyword": False, "omitted": False}})
+    path = tmp_path / "repro.py"
+    reproducer.write(finding, str(path))
+    proc = subprocess.run([sys.executable, str(path)], capture_output=True, text=True,
+                          timeout=120)
+    assert proc.returncode in (0, 1), proc.stderr
+    assert "fractions.Fraction" in proc.stdout
+    assert "Fraction(22, 7)" in proc.stdout
+
+
+def test_end_to_end_method_run(tmp_path):
+    from vistafuzz.runner import RunConfig, run
+    out = tmp_path / "run"
+    summary = run(RunConfig(lib="decimal", out_dir=str(out), budget_sec=2.0,
+                            case_timeout=5, extractor="signature",
+                            apis=["decimal.Decimal.compare", "decimal.Decimal.adjusted"]))
+    assert summary["apis_tested"] == 2
+    assert summary["cases_executed"] > 0
+
+
 def test_end_to_end_numpy_run(tmp_path):
     from vistafuzz.runner import RunConfig, run
     out = tmp_path / "run"

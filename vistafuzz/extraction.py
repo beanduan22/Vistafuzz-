@@ -4,8 +4,8 @@ import re
 from typing import Any
 
 from . import llm as llm_mod
-from .collector import ApiRecord, signature_params
-from .models import (ApiSpec, KINDS, ParamSpec, Relationship,
+from .collector import ApiRecord, receiver_record, signature_params
+from .models import (ApiSpec, INT_NAMES, KINDS, ParamSpec, Relationship,
                      REL_AXIS_OF, REL_DTYPE_FOLLOWS, REL_SHAPE_FOLLOWS,
                      SUPPORTED_RELATIONSHIPS)
 from .prompt import build_prompt
@@ -134,7 +134,9 @@ def _kind_from_text(name: str, text: str, default: Any) -> str:
         return "int"
     if isinstance(default, float) or any(w in blob for w in _FLOAT_WORDS):
         return "number"
-    return "array"
+    if name.lower() in INT_NAMES:
+        return "int"
+    return "array" if text.strip() else "unknown"
 
 
 _RANGE_RE = re.compile(r"(?:in|within|between)\s*[\[\(]\s*(-?[\d.eE+-]+)\s*,\s*(-?[\d.eE+-]+)\s*[\]\)]")
@@ -221,25 +223,45 @@ def extract_offline(record: ApiRecord) -> list[ParamSpec]:
     return specs
 
 
-def extract(record: ApiRecord, *, extractor: str = "llm",
-            config: llm_mod.LLMConfig | None = None) -> ApiSpec:
-    notes: list[str] = []
-    params: list[ParamSpec] = []
-    used = extractor
+_RECEIVER_CACHE: dict[tuple[str, str], list[ParamSpec]] = {}
 
+
+def _extract_params(record: ApiRecord, extractor: str,
+                    config: llm_mod.LLMConfig | None,
+                    notes: list[str]) -> tuple[list[ParamSpec], str]:
     if extractor == "llm":
         config = config or llm_mod.LLMConfig.from_env()
         try:
-            params = extract_with_llm(record, config)
-            used = f"llm:{config.backend}:{config.model}"
+            return extract_with_llm(record, config), f"llm:{config.backend}:{config.model}"
         except llm_mod.LLMError as exc:
             notes.append(f"llm extraction failed ({exc}); used offline fallback")
-            params = extract_offline(record)
-            used = "signature(fallback)"
-    elif extractor == "signature":
-        params = extract_offline(record)
-    else:
-        raise ValueError(f"unknown extractor {extractor!r}")
+            return extract_offline(record), "signature(fallback)"
+    if extractor == "signature":
+        return extract_offline(record), "signature"
+    raise ValueError(f"unknown extractor {extractor!r}")
+
+
+def extract(record: ApiRecord, *, extractor: str = "llm",
+            config: llm_mod.LLMConfig | None = None) -> ApiSpec:
+    notes: list[str] = []
+    params, used = _extract_params(record, extractor, config, notes)
+
+    receiver_params: list[ParamSpec] = []
+    receiver_path = ""
+    if record.is_method:
+        receiver_path = record.class_path
+        key = (receiver_path, extractor)
+        if key in _RECEIVER_CACHE:
+            receiver_params = [ParamSpec.from_json(p.to_json())
+                               for p in _RECEIVER_CACHE[key]]
+        else:
+            base = receiver_record(record)
+            if base is not None:
+                receiver_params, _ = _extract_params(base, extractor, config, notes)
+                _RECEIVER_CACHE[key] = [ParamSpec.from_json(p.to_json())
+                                        for p in receiver_params]
 
     return ApiSpec(api=record.api, signature_text=record.signature_text,
-                   doc=record.doc[:2000], params=params, extractor=used, notes=notes)
+                   doc=record.doc[:2000], params=params, extractor=used, notes=notes,
+                   is_method=record.is_method, receiver_path=receiver_path,
+                   receiver_params=receiver_params)

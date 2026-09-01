@@ -1,5 +1,5 @@
 ﻿Link,Library,Bug Type,Bug Status
-https://github.com/numpy/numpy/issues/32209,numpy,NaN/Inf,Pending
+https://github.com/numpy/numpy/issues/32209,numpy,NaN/Inf,Fixed
 https://github.com/keras-team/keras/issues/23398,keras,NaN/Inf,Others
 https://github.com/keras-team/keras/issues/23399,keras,NaN/Inf,Others
 https://github.com/keras-team/keras/issues/23400,keras,NaN/Inf,Others

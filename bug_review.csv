@@ -20,7 +20,7 @@ https://github.com/tensorflow/tensorflow/issues/124773,tensorflow,NaN/Inf,Fixed
 https://github.com/tensorflow/tensorflow/issues/124774,tensorflow,NaN/Inf,Fixed
 https://github.com/pytorch/pytorch/issues/192291,torch,NaN/Inf,Others
 https://github.com/pytorch/pytorch/issues/192293,torch,NaN/Inf,Fixed
-https://github.com/pytorch/pytorch/issues/192294,torch,NaN/Inf,Others
+https://github.com/pytorch/pytorch/issues/192294,torch,NaN/Inf,Fixed
 https://github.com/mindspore-ai/mindspore/issues/397,mindspore,NaN/Inf,Fixed
 https://github.com/mindspore-ai/mindspore/issues/398,mindspore,NaN/Inf,Pending
 https://github.com/mindspore-ai/mindspore/issues/399,mindspore,NaN/Inf,Pending

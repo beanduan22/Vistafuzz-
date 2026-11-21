@@ -9,9 +9,8 @@ supported inter-parameter **relationships**), materializes the arguments into
 library-native runtime objects, invokes the API, and applies the **crash** and
 **NaN** oracles.
 
-The tool is library-agnostic: there is no per-library table, adapter or op list
-anywhere in the codebase. Any importable Python library can be targeted with
-`--lib <name>`.
+The target library is selected with `--lib <name>`, and individual APIs with
+`--api <dotted.path>`.
 
 This repository contains the tool only — no experimental data, no results, no
 pre-recorded findings.
@@ -201,4 +200,3 @@ extraction and its fallback, signature-validation precedence, envelope and
 variant derivation, all three relationship resolutions, recipe determinism,
 materialization, oracle classification, and an end-to-end run with reproducer
 execution.
-

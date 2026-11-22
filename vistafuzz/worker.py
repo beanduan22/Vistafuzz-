@@ -9,7 +9,7 @@ import time
 import traceback
 from typing import Any
 
-from . import generation, oracles
+from . import direct, generation, oracles, relationships
 from .collector import collect_api, resolve
 from .constraints import DATA_LIKE_NAMES, envelope_for, initialize
 from .materialize import materialize
@@ -130,6 +130,9 @@ def run_job(job: dict[str, Any]) -> int:
     case_timeout = int(job.get("case_timeout", 10))
     max_cases = int(job.get("max_cases", 0)) or None
     rng = random.Random(job.get("seed", 0))
+    disabled = generation.VARIANTS[job.get("variant", "full")]
+    resolve_relationships = "relationships" not in disabled
+    required_sources = relationships.required_sources(spec.params) if resolve_relationships else set()
     log = EventLog(job["events_path"])
 
     record = collect_api(api)
@@ -138,6 +141,7 @@ def run_job(job: dict[str, Any]) -> int:
         log.close()
         return 0
     target = record.obj
+    direct_generator = direct.load(job["generator_path"]) if job.get("generator_path") else None
     method_name = api.rsplit(".", 1)[1] if spec.is_method else ""
     receiver_cls = resolve(spec.receiver_path) if spec.is_method else None
     if spec.is_method and receiver_cls is None:
@@ -146,8 +150,16 @@ def run_job(job: dict[str, Any]) -> int:
         log.close()
         return 0
 
-    seed_args = initialize(spec.params, seed=job.get("seed", 0))
-    if not seed_args and any(p.required for p in spec.params) and not spec.is_method:
+    deadline = time.monotonic() + budget
+    try:
+        seed_args = {} if direct_generator else initialize(
+            spec.params, seed=job.get("seed", 0), resolve_relationships=resolve_relationships)
+        ordered = relationships.dependency_order(spec.params) if resolve_relationships else spec.params
+    except (ValueError, TypeError) as exc:
+        log.write({"event": "skip", "api": api, "reason": str(exc)})
+        log.close()
+        return 0
+    if not direct_generator and not seed_args and any(p.required for p in spec.params) and not spec.is_method:
         log.write({"event": "skip", "api": api,
                    "reason": "no supported value for a required parameter"})
         log.close()
@@ -159,40 +171,58 @@ def run_job(job: dict[str, Any]) -> int:
     max_findings = int(job.get("max_findings", 5))
     seen_findings: set[tuple] = set()
     oracle_hits = 0
-    deadline = time.time() + budget
     cases = 0
     log.write({"event": "api_start", "api": api, "budget_sec": budget,
                "params": [p.name for p in spec.params]})
 
-    while time.time() < deadline and (max_cases is None or cases < max_cases):
+    while time.monotonic() < deadline and (max_cases is None or cases < max_cases):
         cases += 1
-        new_args = dict(seed_args)
-        for spec_param in spec.params:
-            if spec_param.call_kind in ("var_positional", "var_keyword"):
+        if direct_generator:
+            try:
+                positional, keyword, new_args = direct.generate(direct_generator, rng, record, spec)
+                satisfied = True
+            except Exception as exc:
+                log.write({"event": "result", "case": cases, "status": "ungeneratable",
+                           "detail": f"{type(exc).__name__}: {exc}"})
                 continue
-            if not spec_param.required and spec_param.has_default:
-                include = 0.5 if spec_param.doc else 0.25
-                if rng.random() > include:
-                    new_args[spec_param.name] = Value(
-                        kind="default", payload=spec_param.default, omitted=True,
-                        recipe={"form": "const", "value": spec_param.default},
-                        strategy="default")
+        else:
+            new_args = dict(seed_args)
+            for spec_param in ordered:
+                if spec_param.call_kind in ("var_positional", "var_keyword"):
                     continue
-            variants = generation.derive_variants(spec_param, new_args)
-            if not variants:
+                if not spec_param.required and spec_param.has_default and spec_param.name not in required_sources:
+                    include = 0.5 if spec_param.doc else 0.25
+                    if rng.random() > include:
+                        new_args[spec_param.name] = Value(
+                            kind="default", payload=spec_param.default, omitted=True,
+                            recipe={"form": "const", "value": spec_param.default},
+                            strategy="default")
+                        continue
+                variants = generation.derive_variants(spec_param, new_args, disabled)
+                if not variants:
+                    continue
+                strategy = generation.select_strategy(rng, variants)
+                value = generation.generate(spec_param, new_args, variants, strategy, rng,
+                                             resolve_relationships=resolve_relationships)
+                if value is not None:
+                    new_args[spec_param.name] = value
+            try:
+                if resolve_relationships:
+                    generation.refresh_dependents(spec.params, new_args, rng)
+                satisfied = generation.constraints_satisfied(spec.params, new_args, resolve_relationships)
+            except (ValueError, TypeError):
+                satisfied = False
+            if not satisfied:
+                log.write({"event": "result", "case": cases, "status": "ungeneratable",
+                           "detail": "generated arguments do not satisfy their executable constraints"})
                 continue
-            strategy = generation.select_strategy(rng, variants)
-            value = generation.generate(spec_param, new_args, variants, strategy, rng)
-            if value is not None:
-                new_args[spec_param.name] = value
-        generation.refresh_dependents(spec.params, new_args, rng)
 
-        try:
-            positional, keyword = materialize(api, spec.params, new_args)
-        except Exception as exc:
-            log.write({"event": "result", "case": cases, "status": "unmaterializable",
-                       "detail": f"{type(exc).__name__}: {exc}"})
-            continue
+            try:
+                positional, keyword = materialize(api, spec.params, new_args)
+            except Exception as exc:
+                log.write({"event": "result", "case": cases, "status": "unmaterializable",
+                           "detail": f"{type(exc).__name__}: {exc}"})
+                continue
 
         receiver_described: dict[str, Any] = {}
         bound = target
@@ -232,17 +262,24 @@ def run_job(job: dict[str, Any]) -> int:
 
         described = _describe(new_args)
         log.write({"event": "start", "case": cases, "args": described,
+                   "constraints_satisfied": satisfied,
                    "receiver_args": receiver_described,
                    "n_positional": len(positional), "keywords": sorted(keyword)})
 
-        finite_inputs = oracles.inputs_are_finite(list(positional) + list(keyword.values()))
+        native_inputs = list(positional) + list(keyword.values())
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
         started = time.time()
         if hasattr(signal, "SIGALRM"):
-            signal.alarm(case_timeout)
+            signal.setitimer(signal.ITIMER_REAL, min(case_timeout, remaining) if case_timeout > 0 else remaining)
         try:
             result = bound(*positional, **keyword)
             status, detail = "executed", ""
         except _Timeout:
+            if time.monotonic() >= deadline:
+                log.write({"event": "result", "case": cases, "status": "budget_exhausted"})
+                break
             oracle_hits += 1
             key = _finding_key("crash", "hang", described)
             report = key not in seen_findings and len(seen_findings) < max_findings
@@ -257,7 +294,7 @@ def run_job(job: dict[str, Any]) -> int:
         except BaseException as exc:
             exc_type = type(exc).__name__
             message = str(exc)[:400]
-            verdict = oracles.classify_exception(exc_type, message)
+            verdict = oracles.classify_exception(exc_type, message, constraints_satisfied=satisfied)
             status = "rejected" if verdict == "rejected" else "unexpected_exception"
             detail = f"{exc_type}: {message}"
             if verdict != "rejected":
@@ -265,10 +302,11 @@ def run_job(job: dict[str, Any]) -> int:
             result = None
         finally:
             if hasattr(signal, "SIGALRM"):
-                signal.alarm(0)
+                signal.setitimer(signal.ITIMER_REAL, 0)
         elapsed = round(time.time() - started, 4)
 
         event: dict[str, Any] = {"event": "result", "case": cases, "status": status,
+                                 "constraints_satisfied": satisfied,
                                  "elapsed_sec": elapsed}
         if status == "unexpected_exception":
             oracle_hits += 1
@@ -280,8 +318,8 @@ def run_job(job: dict[str, Any]) -> int:
             seen_findings.add(key)
         elif status == "rejected":
             event["detail"] = detail
-        elif finite_inputs:
-            flagged, why = oracles.check_nan(result)
+        else:
+            flagged, why = oracles.check_nan(result, native_inputs, spec.doc)
             if flagged:
                 oracle_hits += 1
                 event["detail"] = why

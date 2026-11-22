@@ -37,11 +37,13 @@ OUTPUT_SCHEMA = {
             "kind": f"one of {list(KINDS)}",
             "required": "true|false",
             "default": "<default value, or null>",
+            "position": "zero-based integer position",
+            "call_kind": "positional|positional_or_keyword|keyword|var_positional|var_keyword",
             "dtype_candidates": ["float32", "float64", "int32", "..."],
             "shape": {
                 "rank_min": "int|null",
                 "rank_max": "int|null",
-                "dims": "[int,...]|null   # only when the doc fixes concrete dimensions",
+                "dims": "[int,...]|null, only for documented fixed dimensions",
             },
             "constraints": {
                 "min": "number|null",
@@ -73,8 +75,8 @@ EXAMPLES: list[dict[str, Any]] = [
         "output": {
             "params": [
                 {"name": "x", "kind": "array", "required": True, "default": None,
-                 "dtype_candidates": ["float32", "float64"],
-                 "shape": {"rank_min": 1, "rank_max": 4, "dims": None},
+                 "dtype_candidates": [],
+                 "shape": {},
                  "constraints": {}, "enum_values": [], "relationships": [],
                  "doc": "Input array."},
                 {"name": "axis", "kind": "axis", "required": False, "default": None,
@@ -83,7 +85,7 @@ EXAMPLES: list[dict[str, Any]] = [
                  "relationships": [{"kind": "axis_of", "source": "x"}],
                  "doc": "Axis in range [-x.ndim, x.ndim)."},
                 {"name": "dtype", "kind": "dtype", "required": False, "default": None,
-                 "dtype_candidates": ["float32", "float64"], "shape": {},
+                 "dtype_candidates": [], "shape": {},
                  "constraints": {}, "enum_values": [], "relationships": [],
                  "doc": "Type of the returned array."},
                 {"name": "keepdims", "kind": "bool", "required": False, "default": False,
@@ -102,12 +104,12 @@ EXAMPLES: list[dict[str, Any]] = [
         "output": {
             "params": [
                 {"name": "a", "kind": "array", "required": True, "default": None,
-                 "dtype_candidates": ["float32", "float64"],
-                 "shape": {"rank_min": 1, "rank_max": 4, "dims": None},
+                 "dtype_candidates": [],
+                 "shape": {},
                  "constraints": {}, "enum_values": [], "relationships": [],
                  "doc": "First input."},
                 {"name": "b", "kind": "array", "required": True, "default": None,
-                 "dtype_candidates": ["float32", "float64"], "shape": {},
+                 "dtype_candidates": [], "shape": {},
                  "constraints": {}, "enum_values": [],
                  "relationships": [{"kind": "shape_follows", "source": "a"},
                                    {"kind": "dtype_follows", "source": "a"}],
@@ -137,7 +139,13 @@ def _fmt_signature_rows(rows: list[dict[str, Any]]) -> str:
 
 
 def build_prompt(api: str, signature_text: str, doc: str,
-                 signature_rows: list[dict[str, Any]]) -> str:
+                 signature_rows: list[dict[str, Any]], prompt_input: str = "doc+sig") -> str:
+    if prompt_input not in ("doc+sig", "doc-only", "sig-only"):
+        raise ValueError(f"unknown prompt input: {prompt_input}")
+    if prompt_input == "sig-only":
+        doc = ""
+    if prompt_input == "doc-only":
+        signature_text, signature_rows = "", []
     doc = (doc or "").strip()
     if len(doc) > MAX_DOC_CHARS:
         doc = doc[:MAX_DOC_CHARS] + "\n... [documentation truncated]"
@@ -150,7 +158,7 @@ def build_prompt(api: str, signature_text: str, doc: str,
         )
 
     return f"""### Task
-{TASK_INSTRUCTION}
+{TASK_INSTRUCTION if prompt_input != 'doc-only' else TASK_INSTRUCTION.replace('runtime signature', 'documented signature')}
 
 ### API context
 API name: {api}

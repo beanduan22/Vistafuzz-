@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import hashlib
+import json
+import os
 import re
 from typing import Any
 
@@ -8,7 +11,7 @@ from .collector import ApiRecord, receiver_record, signature_params
 from .models import (ApiSpec, INT_NAMES, KINDS, ParamSpec, Relationship,
                      REL_AXIS_OF, REL_DTYPE_FOLLOWS, REL_SHAPE_FOLLOWS,
                      SUPPORTED_RELATIONSHIPS)
-from .prompt import build_prompt
+from .prompt import MAX_DOC_CHARS, build_prompt
 
 DEFAULT_FLOAT_DTYPES = ["float32", "float64"]
 DEFAULT_INT_DTYPES = ["int32", "int64"]
@@ -63,7 +66,7 @@ def parse_llm_params(payload: dict[str, Any]) -> list[ParamSpec]:
             kind = {"tensor": "array", "ndarray": "array", "float": "number",
                     "integer": "int", "boolean": "bool", "string": "str",
                     "tuple": "sequence", "list": "sequence"}.get(kind, "unknown")
-        dtypes = [str(d) for d in (row.get("dtype_candidates") or []) if d]
+        dtypes = [str(d).rsplit(".", 1)[-1] for d in (row.get("dtype_candidates") or []) if d]
         rels = [r for r in (_coerce_rel(e, name) for e in row.get("relationships") or [])
                 if r is not None]
         specs.append(ParamSpec(
@@ -71,7 +74,9 @@ def parse_llm_params(payload: dict[str, Any]) -> list[ParamSpec]:
             kind=kind,
             required=bool(row.get("required", True)),
             default=row.get("default"),
-            has_default=row.get("default") is not None,
+            has_default=not bool(row.get("required", True)),
+            position=row.get("position") if isinstance(row.get("position"), int) else len(specs),
+            call_kind=str(row.get("call_kind") or "positional_or_keyword"),
             dtype_candidates=dtypes,
             shape=_clean_map(row.get("shape"), ("rank_min", "rank_max", "dims")),
             constraints=_clean_map(row.get("constraints"),
@@ -86,9 +91,10 @@ def parse_llm_params(payload: dict[str, Any]) -> list[ParamSpec]:
     return specs
 
 
-def extract_with_llm(record: ApiRecord, config: llm_mod.LLMConfig) -> list[ParamSpec]:
+def extract_with_llm(record: ApiRecord, config: llm_mod.LLMConfig,
+                     prompt_input: str = "doc+sig") -> list[ParamSpec]:
     rows = signature_params(record)
-    prompt = build_prompt(record.api, record.signature_text, record.doc, rows)
+    prompt = build_prompt(record.api, record.signature_text, record.doc, rows, prompt_input)
     text = llm_mod.complete(prompt, config)
     return parse_llm_params(llm_mod.extract_json_object(text))
 
@@ -228,40 +234,56 @@ _RECEIVER_CACHE: dict[tuple[str, str], list[ParamSpec]] = {}
 
 def _extract_params(record: ApiRecord, extractor: str,
                     config: llm_mod.LLMConfig | None,
-                    notes: list[str]) -> tuple[list[ParamSpec], str]:
+                    notes: list[str], prompt_input: str = "doc+sig") -> tuple[list[ParamSpec], str]:
     if extractor == "llm":
         config = config or llm_mod.LLMConfig.from_env()
-        try:
-            return extract_with_llm(record, config), f"llm:{config.backend}:{config.model}"
-        except llm_mod.LLMError as exc:
-            notes.append(f"llm extraction failed ({exc}); used offline fallback")
-            return extract_offline(record), "signature(fallback)"
+        return extract_with_llm(record, config, prompt_input), f"llm:{config.backend}:{config.model}"
     if extractor == "signature":
         return extract_offline(record), "signature"
     raise ValueError(f"unknown extractor {extractor!r}")
 
 
 def extract(record: ApiRecord, *, extractor: str = "llm",
-            config: llm_mod.LLMConfig | None = None) -> ApiSpec:
+            config: llm_mod.LLMConfig | None = None, cache_dir: str = "",
+            prompt_input: str = "doc+sig") -> ApiSpec:
+    config = config or llm_mod.LLMConfig.from_env()
+    identity = {"api": record.api, "doc": record.doc, "signature": record.signature_text,
+                "extractor": extractor, "backend": config.backend, "model": config.model,
+                "temperature": config.temperature, "num_ctx": config.num_ctx,
+                "max_tokens": config.max_tokens, "prompt_input": prompt_input,
+                "prompt": build_prompt(record.api, record.signature_text, record.doc,
+                                       signature_params(record), prompt_input)}
+    key = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
+    cache_path = os.path.join(cache_dir, record.api + "_" + key[:20] + ".json")
+    if cache_dir and os.path.exists(cache_path):
+        with open(cache_path) as handle:
+            return ApiSpec.from_json(json.load(handle)["spec"])
     notes: list[str] = []
-    params, used = _extract_params(record, extractor, config, notes)
+    params, used = _extract_params(record, extractor, config, notes, prompt_input)
 
     receiver_params: list[ParamSpec] = []
     receiver_path = ""
     if record.is_method:
         receiver_path = record.class_path
-        key = (receiver_path, extractor)
-        if key in _RECEIVER_CACHE:
+        receiver_key = (receiver_path, key)
+        if receiver_key in _RECEIVER_CACHE:
             receiver_params = [ParamSpec.from_json(p.to_json())
-                               for p in _RECEIVER_CACHE[key]]
+                               for p in _RECEIVER_CACHE[receiver_key]]
         else:
             base = receiver_record(record)
             if base is not None:
-                receiver_params, _ = _extract_params(base, extractor, config, notes)
-                _RECEIVER_CACHE[key] = [ParamSpec.from_json(p.to_json())
+                receiver_params, _ = _extract_params(base, extractor, config, notes, prompt_input)
+                _RECEIVER_CACHE[receiver_key] = [ParamSpec.from_json(p.to_json())
                                         for p in receiver_params]
 
-    return ApiSpec(api=record.api, signature_text=record.signature_text,
-                   doc=record.doc[:2000], params=params, extractor=used, notes=notes,
+    spec = ApiSpec(api=record.api, signature_text=record.signature_text,
+                   doc=record.doc, params=params, extractor=used, notes=notes,
                    is_method=record.is_method, receiver_path=receiver_path,
-                   receiver_params=receiver_params)
+                   receiver_params=receiver_params, signature_source=record.signature_source,
+                   prompt_input=prompt_input,
+                   documentation_truncated=prompt_input != "sig-only" and len(record.doc) > MAX_DOC_CHARS)
+    if cache_dir:
+        os.makedirs(cache_dir, exist_ok=True)
+        with open(cache_path, "w") as handle:
+            json.dump({"cache_key": key, "spec": spec.to_json()}, handle, indent=2, default=repr)
+    return spec

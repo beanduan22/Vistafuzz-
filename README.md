@@ -1,202 +1,194 @@
-# VistaFuzz — LLM-guided, documentation-based fuzzing for Python libraries
+# VistaFuzz
 
-A self-contained implementation of the approach: for each target API the tool
-collects the **official documentation** and the **runtime signature**, asks an
-LLM to turn them into structured **parameter specifications**, validates those
-specifications against the runtime signature, initializes and then repeatedly
-generates argument lists (varying **type**, **size** and **value**, resolving the
-supported inter-parameter **relationships**), materializes the arguments into
-library-native runtime objects, invokes the API, and applies the **crash** and
-**NaN** oracles.
+Implementation of **Harnessing LLMs for Document-Guided Fuzzing of Python Libraries**.
 
-The target library is selected with `--lib <name>`, and individual APIs with
-`--api <dotted.path>`.
+VistaFuzz collects API documentation and signatures, extracts standardized parameter specifications with a locally served LLM, validates calling information, generates arguments under individual constraints and supported relationships, materializes library-native inputs, and applies crash and NaN oracles.
 
-This repository contains the tool only — no experimental data, no results, no
-pre-recorded findings.
+The ParamSpec schema, extraction prompt, relationship resolver, generation strategies, and oracles are shared across libraries. Library-facing collectors and materialization backends are in `vistafuzz/adapters/`.
 
----
+## Installation and quickstart
 
-## 1. Install
-
-```bash
+~~~bash
 git clone https://github.com/beanduan22/Vistafuzz-.git
 cd Vistafuzz-
-python -m pip install -e .            # only dependency: numpy
-python -m pip install -e ".[dev]"     # plus pytest, to run the test suite
-```
-
-Python ≥ 3.9. Every target library is imported from the *current* interpreter,
-so run the tool with the interpreter in which the target library is installed
-(libraries that need their own environment are simply fuzzed with that
-environment's `python -m vistafuzz.cli ...`).
-
-## 2. Quickstart
-
-```bash
-# 1. what would be tested?
-vistafuzz apis --lib numpy --limit 20
-
-# 2. inspect one API's extracted + validated specification
-vistafuzz extract --api numpy.clip
-
-# 3. fuzz a whole library with a 60 s per-API budget
-vistafuzz fuzz --lib numpy --out runs/numpy --budget 60
-
-# 4. fuzz specific APIs only
-vistafuzz fuzz --api torch.special.i0 --api torch.log --out runs/torch --budget 60
-
-# 5. re-print a finished run
-vistafuzz report --out runs/numpy
-```
-
-Every subcommand is also available as `python -m vistafuzz.cli <subcommand>`.
-
-## 3. LLM configuration
-
-Specification extraction is the only LLM-dependent step. Decoding is greedy
-(temperature 0), which makes extraction deterministic and reproducible.
-
-```bash
-# local open-weight model served by Ollama (default backend)
+python -m pip install -e ".[dev,coverage]"
+ollama pull qwen2.5-coder:32b
 export VISTAFUZZ_LLM_BACKEND=ollama
 export VISTAFUZZ_LLM_MODEL=qwen2.5-coder:32b
 export VISTAFUZZ_OLLAMA_HOST=http://localhost:11434
-export VISTAFUZZ_LLM_TIMEOUT=300          # first call also loads the model
+export VISTAFUZZ_LLM_TIMEOUT=300
+python -m vistafuzz.cli apis --lib numpy --limit 20
+python -m vistafuzz.cli extract --api numpy.clip --spec-dir specs
+python -m vistafuzz.cli fuzz --lib numpy --out runs/numpy --spec-dir specs --budget 60
+python -m vistafuzz.cli report --out runs/numpy
+~~~
 
-# or any OpenAI-compatible endpoint
-export VISTAFUZZ_LLM_BACKEND=openai
-export VISTAFUZZ_LLM_BASE=https://api.openai.com
-export VISTAFUZZ_LLM_KEY=sk-...
-export VISTAFUZZ_LLM_MODEL=gpt-4o
-```
+Install each target library in the interpreter used to run VistaFuzz. The paper uses Python 3.13, with separate Python 3.11/3.10 environments where required by wheel availability.
 
-The same settings are available as flags: `--llm-backend`, `--llm-model`,
-`--llm-host`, `--llm-base-url`.
+The default model is `qwen2.5-coder:32b`, served through Ollama with temperature 0 and a 4,096-token context. Extraction occurs before the per-API testing budget. Specifications are cached and reused without per-test model inference. LLM failures are extraction errors; `--extractor signature` explicitly selects a separate offline diagnostic configuration.
 
-**Offline fallback.** With `--extractor signature`, or automatically when the
-configured endpoint is unreachable, specifications are derived from the runtime
-signature plus shallow documentation cues instead. The fallback is always
-recorded (`"extractor": "signature(fallback)"` in `apis.jsonl`, and a note in the
-extracted spec), so a run is never silently attributed to the LLM path. The
-fallback captures fewer domain constraints — e.g. it does not learn that
-`numpy.arccos` is only defined on `[-1, 1]` — which shows up directly as more
-NaN-oracle false positives.
+`--api` selects individual APIs and may be repeated. `--api-list` accepts a JSON list, a JSON object containing an `apis` list, or a text file with one API path per line.
 
-## 4. What a run produces
+~~~bash
+python -m vistafuzz.cli fuzz --api torch.special.i0 --api torch.nn.functional.gelu --out runs/torch --spec-dir specs --budget 60
+~~~
 
-```
-runs/numpy/
-├── summary.json        # per-library totals (see below)
-├── apis.jsonl          # one row per API: status, cases, executed/rejected, SRG
-├── findings.jsonl      # one row per deduplicated oracle report
-├── reproducers/        # one standalone script per finding
-└── work/               # per-API job + append-only event log (crash attribution)
-```
+## Target libraries
 
-`summary.json` reports the quantities the evaluation metrics are computed from:
+The versions and eligible API counts below are specified in the manuscript. `evaluation/paper.json` records the evaluation settings.
 
-| field | meaning |
+| Library | Import name | Paper version | Eligible APIs |
+|---|---|---|---:|
+| PyTorch | torch | 2.12.0 | 745 |
+| TensorFlow | tensorflow | 2.21.0 | 1,043 |
+| JAX | jax | 0.10.1 | 658 |
+| Keras | keras | 3.14.0 | 197 |
+| PaddlePaddle | paddle | 3.3.1 | 900 |
+| OneFlow | oneflow | 0.9.0 | 213 |
+| MindSpore | mindspore | 2.9.0 | 1,209 |
+| Chainer | chainer | 7.8.1 | 137 |
+| NumPy | numpy | 2.2.6 | 643 |
+| SciPy | scipy | 1.16.3 | 1,405 |
+| scikit-learn | sklearn | 1.8.0 | 238 |
+| OpenCV | cv2 | 4.10.0 | 330 |
+| Total | | | 7,718 |
+
+The paper starts from 9,114 documented numerical API candidates and excludes APIs lacking usable documentation or signatures, requiring external resources or unavailable devices, lacking outputs applicable to the oracles, or requiring substantial state or setup through other APIs.
+
+Discovery filters numerical callables. A fixed API manifest is needed to reproduce an evaluated cohort exactly. Default campaigns test individual functions. Receiver construction is available with `--methods` for separate exploratory runs.
+
+## Specifications and generation
+
+ParamSpec records `name`, `kind`, `required`, `default`, `position`, `call_kind`, `constraints`, `enum_values`, `dtype_candidates`, `shape`, and `doc`. Supported cross-parameter references are stored in `relationships`.
+
+| Relationship | Execution |
 |---|---|
-| `apis_discovered` / `apis_tested` | discovered APIs, and those that survived validation |
-| `apis_covered` | APIs exercised at least once (**covered APIs** metric) |
-| `apis_excluded` | APIs dropped by validation, with the reason in `apis.jsonl` |
-| `cases_generated` / `cases_executed` / `cases_rejected` | test-case counts |
-| `valid_generation_rate_pct` | executed / (executed + rejected) — the **SRG** metric |
-| `findings` / `oracle_hits_total` | deduplicated findings, and raw oracle triggers |
+| `shape_follows` | Follow the referenced argument's shape |
+| `axis_of` | Bound an axis by the referenced argument's rank |
+| `dtype_follows` | Follow the referenced argument's dtype |
 
-Code coverage is deliberately *not* measured inside the tool: wrap the run in
-the coverage tool of your choice, e.g.
+Dependencies are resolved in topological order. Cycles and unresolved references exclude the specification. Unsupported relationships remain in the documentation and are not executed.
 
-```bash
-coverage run --source=numpy -m vistafuzz.cli fuzz --lib numpy --out runs/numpy --budget 60
-coverage report
-```
+Validation aligns names, positions, required status, defaults, and calling forms with the target signature. C-extension bindings may expose calling syntax through their runtime docstrings; these records are marked `binding_doc` rather than `runtime`. APIs without usable calling information are excluded.
 
-For libraries whose functionality lives in native code, build the library with
-`--coverage` and collect with `gcov`/`lcov` around the same command.
+Generation varies types, sizes, and values. Numerical strategies include random, boundary, extreme, mathematically sensitive, and permitted non-finite values. Image-like inputs also receive noise, masking, and division. Numerical bounds are enforced in the selected dtype, sequence lengths are preserved, and fixed shapes and ranks are respected.
 
-### Reproducers
+Synthesis is bounded to 262,144 array elements and rank 32. Unsupported essential inputs are skipped rather than changed to violate their constraints. Native backends preserve the requested shape and dtype.
 
-Each finding is emitted as a standalone script that embeds the value-synthesis
-code, rebuilds the exact arguments from their recipes, calls the API, and
-**exits 1 while the finding reproduces, 0 once it is fixed** — so the scripts
-double as regression tests:
+Full source documentation and extraction provenance are saved with specifications. Prompt documentation is bounded by `MAX_DOC_CHARS` in `prompt.py` and the configured model context.
 
-```bash
-python runs/numpy/reproducers/numpy_log__001.py; echo $?
-```
+## Oracles and triage
 
-## 5. How it works
+The crash oracle records fatal signals, abnormal exits, timeouts, internal failures, and unexpected exceptions. Ordinary input-validation errors count as rejected invocations. Assertion failures on arguments satisfying executable constraints are retained as candidates, including the OpenCV border-assertion pattern discussed in the paper.
 
-| Stage | Module | Notes |
-|---|---|---|
-| Information collection | `collector.py` | generic module walk; documentation + runtime signature. When the runtime signature is opaque (`*args, **kwargs`, as in C-extension APIs), the **documented** signature line is parsed instead — including `f(a[, b])` optional-group and `-> ret` return-annotation forms. |
-| Prompt construction | `prompt.py` | four parts: task instruction, API context, output schema, worked examples. The model is asked for one `ParamSpec` per signature parameter, never for executable code. |
-| LLM extraction | `extraction.py` | parses the JSON response; normalizes relationship wording; drops anything outside the three supported forms. |
-| Signature validation | `validation.py` | names, positions, required status, call kinds and defaults are taken from the runtime signature whenever the two sources disagree; parameters absent at runtime are removed; APIs with unresolved conflicts are excluded. |
-| Constraints & initialization | `constraints.py` | turns a `ParamSpec` into an *envelope* (kinds, dtypes, shapes, value patterns, enum values, bounds) and draws the seed argument list. |
-| Relationship resolution | `relationships.py` | shape following, rank-bounded axis, type following — each resolved from the concrete properties of an already-generated argument. |
-| Generation | `generation.py` | type / size / value strategies over the envelope; image-like arrays additionally get noise, masking and division. |
-| Materialization | `materialize.py` | duck-typed conversion into library-native objects (`asarray`/`array`/`tensor`/`constant`/`from_numpy`, plus the library's own dtype objects), falling back to NumPy. |
-| Automation | `runner.py`, `worker.py` | Algorithm 1. One isolated worker process per API; an event is fsync'd before every invocation, so a fatal signal is attributed to the exact in-flight argument list. |
-| Oracles | `oracles.py` | crash and NaN (below). |
+The NaN oracle checks numerical outputs for non-finite values unexplained by input propagation. Calls containing non-finite inputs are checked, including unexpected NaNs at infinity-valued elements. When documentation explicitly requires NaN propagation, finite or Boolean outputs that lose it are also flagged.
 
-### The three executable relationships
+Findings are candidates for minimization and documentation checking. Expected non-finite results, extraction errors, duplicates, and documented behavior are removed during triage before developer reporting. Satisfying extracted constraints does not establish that the specification is complete.
 
-`shape_follows`, `axis_of`, `dtype_follows`. A documented relationship that
-cannot be normalized into one of these stays in the `doc` field and is **not**
-enforced; the affected parameter is then generated from its individual type,
-shape, value and default constraints only. This is a deliberate scope limit, not
-a claim of completeness.
+## Run artifacts and metrics
 
-### Oracles
+~~~text
+runs/numpy/
+├── summary.json
+├── apis.jsonl
+├── findings.jsonl
+├── specs/
+├── reproducers/
+├── coverage/
+└── work/
+~~~
 
-* **Crash** — fatal signals, abnormal exit codes, per-case hangs, and
-  *unexpected* exceptions. Ordinary input validation is not a bug: an exception
-  is only unexpected when its type is inherently suspicious (`SystemError`,
-  `RecursionError`, …) or its message carries an internal-failure marker
-  (`INTERNAL ASSERT`, `check failed`, `should not happen`, …). Everything else —
-  library-defined validation exceptions (`cv2.error`, TF's
-  `InvalidArgumentError`), OpenCV's `(-215:Assertion failed) …` argument checks,
-  and the plain `assert` statements libraries such as OneFlow use to validate
-  arguments — counts as a *rejected input* and feeds the SRG metric. A bare
-  `AssertionError` with no message remains suspicious. Out-of-memory failures
-  (including an OOM abort of the worker) are attributed to the generated input
-  size, not to the library.
-* **NaN** — a finite-input invocation whose numeric output contains NaN or
-  infinity. "Within the supported domain" is approximated by (a) generating only
-  values allowed by the extracted constraints and (b) requiring every numeric
-  input of the flagged invocation to be finite.
+`specs/` is replaced by `--spec-dir` when a shared cache is selected. `coverage/` is produced when coverage measurement is enabled.
 
-Findings are deduplicated per API by (oracle, failure kind, per-parameter value
-pattern/dtype/rank) and capped by `--max-findings-per-api` (default 5), so one
-systematic failure does not produce thousands of rows.
+| Output | Contents |
+|---|---|
+| `summary.json` | API reach, extraction outcomes, VGR, relationship prevalence, preprocessing time, findings, and requested coverage |
+| `apis.jsonl` | Per-API accepted/rejected calls, extraction source, signature source, relationship stratum, and preprocessing time |
+| `findings.jsonl` | Candidate failures and exact argument recipes |
+| `specs/` | Reusable extraction records keyed by API context and model/prompt configuration |
+| `work/` | Validated specifications, worker jobs, and invocation events |
+| `reproducers/` | Standalone programs using the same synthesis, materialization, and oracle logic |
 
+VGR is accepted invocations divided by accepted plus input-rejected invocations. Generation attempts that cannot construct or materialize arguments are recorded separately. Covered APIs have at least one accepted invocation. Candidate findings are distinct from confirmed bugs.
 
-## 6. Useful flags
+Reproducers return 1 when a checked finding reproduces and 0 when it does not. Fatal native signals terminate the script with the corresponding non-zero process status.
 
-```
---budget SECONDS            per-API testing budget (default 60)
---case-timeout SECONDS      per-invocation timeout inside the worker (default 10)
---max-apis N                stop after N discovered APIs
---max-cases N               cap cases per API (default: bounded only by --budget)
---max-findings-per-api N    deduplicated findings kept per API (default 5)
---include REGEX             only APIs whose dotted path matches
---max-depth N               submodule depth to walk (default 3)
---all                       skip the numeric-API filter
---seed N                    seed for generation (runs are reproducible)
---no-reproducers            do not emit reproducer scripts
-```
+## Coverage
 
-## 7. Tests
+Python coverage runs inside each API worker.
 
-```bash
-PYTHONPATH=. python -m pytest tests -q
-```
+~~~bash
+python -m vistafuzz.cli fuzz --lib numpy --out runs/numpy-coverage --spec-dir specs --budget 60 --coverage
+~~~
 
-The suite covers collection (including opaque C-extension signatures),
-extraction and its fallback, signature-validation precedence, envelope and
-variant derivation, all three relationship resolutions, recipe determinism,
-materialization, oracle classification, and an end-to-end run with reproducer
-execution.
+Combined data and JSON line records are written under `coverage/`.
+
+For C/C++ coverage, build the target library with GCOV instrumentation. With LCOV installed, pass `--native-build-dir` to reset and capture native counters automatically for each run. Alternatively, collect an LCOV trace for that run. Reset native counters between tools and runs. `--native-coverage path/to/native.info` imports the trace. Summaries report Python and native line counts separately and their sum. Runs without a native trace do not claim native coverage.
+
+## Repeated experiments and ablations
+
+Every tool receives 60 seconds per supported API. One-time preprocessing is outside the budget; generation and invocation are inside it. Comparisons require the same API cohort, instrumented build, hardware, and oracles.
+
+~~~bash
+python -m vistafuzz.cli fuzz --lib numpy --out runs/numpy-five --spec-dir specs --budget 60 --repeat 5 --coverage
+python -m vistafuzz.cli fuzz --lib numpy --out runs/numpy-ablation --spec-dir specs --budget 60 --repeat 5 --variants full,noT,noS,noRand,noBound,noNF,noRel,noVal --coverage
+python -m vistafuzz.cli fuzz --lib numpy --out runs/numpy-budget --spec-dir specs --repeat 5 --budgets 15,30,60,120 --coverage
+~~~
+
+| Variant | Disabled component |
+|---|---|
+| `noT` | Type generation |
+| `noS` | Size generation |
+| `noRand` | Ordinary random values and random noise |
+| `noBound` | Boundary, extreme, and mathematically sensitive value pools |
+| `noNF` | Non-finite generation |
+| `noRel` | Relationship resolution |
+| `noVal` | Runtime-signature validation |
+
+`noRel` retains individual constraints and relationship labels for `R+`/`R-` analysis. `noVal` uses the same cached raw extraction as the full configuration.
+
+`experiments.json` contains per-run values, means, standard deviations, and candidate failure-group unions. Paper issue counts require a triage mapping from candidates to actual issues.
+
+The `common` command intersects per-tool `apis.jsonl` files using accepted invocations. Supply its output to every compared tool.
+
+~~~bash
+python -m vistafuzz.cli common runs/vistafuzz/apis.jsonl runs/baseline/apis.jsonl --out common-apis.json
+python -m vistafuzz.cli fuzz --lib torch --api-list common-apis.json --out runs/common --spec-dir specs --budget 60 --repeat 5 --coverage
+~~~
+
+## Same-model LLM-Direct
+
+LLM-Direct gives the same model the documentation and signature once before testing. It generates `generate_args(rng)`, returning positional and keyword arguments. The cached function runs in the same worker, budget, and oracles, without ParamSpec-based generation or relationship resolution.
+
+~~~bash
+python -m vistafuzz.cli fuzz --lib torch --api-list common-apis.json --generator llm-direct --out runs/direct --spec-dir direct-generators --budget 60 --repeat 5 --coverage
+~~~
+
+The released implementations and library-specific resources of FreeFuzz, DocTer, ACETest, TitanFuzz, and FUTURE must be installed separately.
+
+## Prompt, model, and known-bug analyses
+
+~~~bash
+python -m vistafuzz.cli fuzz --lib numpy --api-list sampled-apis.json --out runs/doc-sig --spec-dir specs --prompt-input doc+sig
+python -m vistafuzz.cli fuzz --lib numpy --api-list sampled-apis.json --out runs/doc-only --spec-dir specs --prompt-input doc-only
+python -m vistafuzz.cli fuzz --lib numpy --api-list sampled-apis.json --out runs/sig-only --spec-dir specs --prompt-input sig-only
+python -m vistafuzz.cli fuzz --lib numpy --api-list sampled-apis.json --out runs/model-7b --spec-dir specs --llm-model qwen2.5-coder:7b
+~~~
+
+Prompt and model configurations have independent cache identities. The paper uses 240 APIs for prompt ablation, 180 for model comparison and relationship analysis, and 360 for specification accuracy. Accuracy and agreement analyses require the original annotations.
+
+A known-bug manifest contains a `bugs` list. Each record supplies `id`, `api`, `oracle` (`crash` or `nan`), and `validator`. A validator is a Python file exposing `matches(finding)`, or a `file.py:function` reference, which checks the specific reported failure.
+
+~~~bash
+python -m vistafuzz.cli fuzz --lib torch --benchmark known-bugs.json --out runs/known-bugs --spec-dir specs --budget 60 --repeat 5
+~~~
+
+A bug is detected if its validator matches a flagged case in any run. Unsupported APIs miss their bugs. Use actual confirmed bugs present in the evaluated library versions.
+
+The historical API manifests, extracted specifications, five-run coverage data, annotations, and 27 benchmark records are not included in this checkout. `evaluation/paper.json` contains manuscript settings, not regenerated results. `bug_review.csv` is preserved as the issue-status ledger. `python -m vistafuzz.cli bugs --file bug_review.csv` prints its current counts in the paper's column order; Fixed is included in Confirmed.
+
+## Tests
+
+~~~bash
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest tests -q
+~~~

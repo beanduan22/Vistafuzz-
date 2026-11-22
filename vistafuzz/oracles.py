@@ -48,9 +48,11 @@ SUSPICIOUS_EXCEPTIONS = frozenset({
 })
 
 
-def classify_exception(exc_type: str, message: str) -> str:
+def classify_exception(exc_type: str, message: str, constraints_satisfied: bool = False) -> str:
     if is_resource_exhaustion(message):
         return "rejected"
+    if constraints_satisfied and (exc_type == "AssertionError" or "(-215:Assertion failed)" in message):
+        return "unexpected"
     if _MARKER_RE.search(message or ""):
         return "unexpected"
     if exc_type in REJECTION_EXCEPTIONS:
@@ -62,65 +64,105 @@ def classify_exception(exc_type: str, message: str) -> str:
     return "rejected"
 
 
-def _iter_numeric(obj: Any, depth: int = 0):
-    if depth > 3 or obj is None:
+def _iter_numeric(obj: Any, depth: int = 0, include_bool: bool = False, _seen=None):
+    if obj is None or depth > 32:
         return
+    if _seen is None:
+        _seen = set()
+    if id(obj) in _seen:
+        return
+    _seen.add(id(obj))
     if isinstance(obj, (bool, np.bool_)):
+        if include_bool:
+            yield np.asarray(obj)
         return
-    if isinstance(obj, (int, float, np.integer, np.floating, complex, np.complexfloating)):
+    if isinstance(obj, (int, float, np.number, complex)):
         yield np.asarray(obj)
         return
     if isinstance(obj, np.ndarray):
-        if obj.dtype.kind in "fc":
+        if obj.dtype.kind in ("biufc" if include_bool else "iufc"):
             yield obj
         return
-    if isinstance(obj, (list, tuple, set)):
-        for item in list(obj)[:8]:
-            yield from _iter_numeric(item, depth + 1)
+    if isinstance(obj, (list, tuple, set, dict)):
+        values = obj.values() if isinstance(obj, dict) else obj
+        for item in values:
+            yield from _iter_numeric(item, depth + 1, include_bool, _seen)
         return
-    if isinstance(obj, dict):
-        for item in list(obj.values())[:8]:
-            yield from _iter_numeric(item, depth + 1)
-        return
-    for attr in ("detach", "cpu", "numpy", "asnumpy", "to_numpy", "__array__"):
-        fn = getattr(obj, attr, None)
-        if not callable(fn):
-            continue
+    for attr in ("detach", "cpu", "numpy", "asnumpy", "to_numpy", "array", "__array__"):
         try:
-            converted = fn()
+            fn = getattr(obj, attr, None)
+            converted = fn() if callable(fn) else fn
         except Exception:
             continue
-        if isinstance(converted, np.ndarray):
-            if converted.dtype.kind in "fc":
-                yield converted
-            return
-        if converted is not obj and depth < 3:
-            yield from _iter_numeric(converted, depth + 1)
+        if converted is None or converted is obj:
+            continue
+        arrays = list(_iter_numeric(converted, depth + 1, include_bool, _seen))
+        if arrays:
+            yield from arrays
             return
 
 
 def inputs_are_finite(natives: list[Any]) -> bool:
-    for item in natives:
-        for arr in _iter_numeric(item):
-            if arr.size and not np.all(np.isfinite(arr)):
-                return False
-    return True
+    return all(np.all(np.isfinite(arr)) for item in natives for arr in _iter_numeric(item))
 
 
-def check_nan(result: Any) -> tuple[bool, str]:
-    for arr in _iter_numeric(result):
+def _nan_propagates(doc):
+    for sentence in re.split(r"[\n.;]", doc.lower()):
+        if re.search(r"\b(?:not|never|ignore|ignores|ignored)\b", sentence):
+            continue
+        if re.search(r"nan.{0,100}propagat|propagat.{0,100}nan", sentence):
+            return True
+        if re.search(r"(?:return|output|result).{0,40}nan.{0,50}(?:input|argument).{0,30}nan", sentence):
+            return True
+        if re.search(r"(?:input|argument).{0,30}nan.{0,50}(?:return|output|result).{0,30}nan", sentence):
+            return True
+    return False
+
+
+def _matching_mask(output, inputs, nan_only=False):
+    covered = np.zeros(output.shape, dtype=bool)
+    for source in inputs:
+        try:
+            source = np.broadcast_to(source, output.shape)
+        except ValueError:
+            continue
+        matching = np.isnan(output) & np.isnan(source)
+        if not nan_only and output.dtype.kind != "c" and source.dtype.kind != "c":
+            matching |= np.isposinf(output) & np.isposinf(source)
+            matching |= np.isneginf(output) & np.isneginf(source)
+        covered |= matching
+    return covered
+
+
+def check_nan(result: Any, inputs=None, doc: str = "") -> tuple[bool, str]:
+    sources = [a for value in (inputs or []) for a in _iter_numeric(value)]
+    outputs = list(_iter_numeric(result, include_bool=True))
+    expects_nan = _nan_propagates(doc) and any(np.any(np.isnan(a)) for a in sources)
+    for arr in outputs:
         if not arr.size:
             continue
-        finite = np.isfinite(arr)
-        if np.all(finite):
+        if expects_nan:
+            for source in sources:
+                try:
+                    expected = np.broadcast_to(np.isnan(source), arr.shape)
+                except ValueError:
+                    continue
+                if np.any(expected & ~np.isnan(arr)):
+                    return True, "documented NaN propagation is absent from the output"
+        bad_mask = ~np.isfinite(arr)
+        if not np.any(bad_mask):
             continue
-        flat = np.asarray(arr).ravel()
-        bad = flat[~np.isfinite(flat)]
-        n_nan = int(np.sum(np.isnan(flat)))
-        n_inf = int(bad.size - n_nan)
-        sample = ", ".join(repr(float(v)) for v in bad[:3])
-        return True, (f"output contains {n_nan} NaN and {n_inf} inf value(s) "
-                      f"(e.g. {sample}) for finite inputs")
+        unexpected = bad_mask & ~_matching_mask(arr, sources)
+        if np.any(unexpected):
+            flat = np.asarray(arr)[unexpected]
+            n_nan = int(np.count_nonzero(np.isnan(flat)))
+            n_inf = int(flat.size - n_nan)
+            sample = ", ".join(repr(v.item()) for v in flat[:3])
+            return True, (f"output contains {n_nan} NaN and {n_inf} infinity value(s) "
+                          f"not explained by input propagation (e.g. {sample}); "
+                          "check the documented numerical domain")
+    if expects_nan and outputs and all(np.all(np.isfinite(a)) for a in outputs):
+        return True, "documented NaN propagation produced a finite or Boolean output"
     return False, ""
 
 

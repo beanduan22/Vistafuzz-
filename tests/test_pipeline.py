@@ -79,13 +79,12 @@ def test_parse_llm_params_normalizes_relationships():
     assert specs[2].axis_of == "x"
 
 
-def test_extract_falls_back_when_llm_unreachable():
-    from vistafuzz.llm import LLMConfig
+def test_extract_reports_llm_failure_without_changing_extractor():
+    from vistafuzz.llm import LLMConfig, LLMError
     record = collect_api("numpy.clip")
     cfg = LLMConfig(backend="ollama", host="http://127.0.0.1:1", timeout_sec=0.5)
-    spec = extract(record, extractor="llm", config=cfg)
-    assert spec.extractor == "signature(fallback)"
-    assert spec.notes and "llm extraction failed" in spec.notes[0]
+    with pytest.raises(LLMError):
+        extract(record, extractor="llm", config=cfg)
 
 
 def _record_and_spec(api="numpy.clip"):
@@ -107,12 +106,12 @@ def test_validation_runtime_information_wins():
     assert result.spec.param("not_a_real_parameter") is None
 
 
-def test_validation_drops_relationships_to_missing_sources():
+def test_validation_rejects_relationships_to_missing_sources():
     record, spec = _record_and_spec()
     spec.params[0].relationships = [Relationship(REL_SHAPE_FOLLOWS, "ghost")]
     result = validate(spec, record)
-    assert result.ok
-    assert result.spec.params[0].relationships == []
+    assert not result.ok
+    assert "unresolvable" in result.reason
 
 
 def test_envelope_respects_bounds_and_excludes_nonfinite():
@@ -261,7 +260,7 @@ def test_crash_verdict():
 
 def test_method_discovery_and_receiver_extraction():
     from vistafuzz.collector import collect, receiver_record
-    records = collect("decimal", max_depth=1, limit=20)
+    records = collect("decimal", max_depth=1, limit=20, methods=True)
     methods = [r for r in records if r.is_method]
     assert methods, "no class methods discovered"
     record = methods[0]

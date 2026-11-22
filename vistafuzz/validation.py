@@ -4,6 +4,7 @@ from dataclasses import dataclass
 
 from .collector import ApiRecord, receiver_record, signature_params
 from .models import ApiSpec, ParamSpec, SUPPORTED_RELATIONSHIPS
+from .relationships import dependency_order
 
 
 @dataclass
@@ -74,23 +75,22 @@ def _validate_receiver(spec: ApiSpec, record: ApiRecord) -> str:
 
 
 def validate(spec: ApiSpec, record: ApiRecord) -> ValidationResult:
+    if not record.doc.strip():
+        return ValidationResult(None, False, "no usable documentation")
+    if len({p.name for p in spec.params}) != len(spec.params):
+        return ValidationResult(None, False, "duplicate parameter names in extraction")
     if spec.is_method:
         reason = _validate_receiver(spec, record)
         if reason:
             return ValidationResult(None, False, reason)
     rows = signature_params(record)
     if not rows:
-        for idx, param in enumerate(spec.params):
-            param.position = idx
-        if not spec.params:
-            if spec.is_method:
+        if spec.is_method and record.signature is not None:
+            remaining = [p for p in record.signature.parameters if p not in ("self", "cls")]
+            if not remaining:
                 spec.params = []
                 return ValidationResult(spec, True)
-            return ValidationResult(None, False, "no runtime signature and no parameters")
-        spec.notes.append("runtime signature unavailable; keyword invocation only")
-        for param in spec.params:
-            param.call_kind = "keyword"
-        return ValidationResult(spec, True)
+        return ValidationResult(None, False, "no usable runtime or binding signature")
 
     by_name = {row["name"]: row for row in rows}
     validated: list[ParamSpec] = []
@@ -123,10 +123,15 @@ def validate(spec: ApiSpec, record: ApiRecord) -> ValidationResult:
                 if r.kind in SUPPORTED_RELATIONSHIPS and r.source in surviving
                 and r.source != param.name]
         if len(kept) != len(param.relationships):
-            spec.notes.append(f"dropped unresolvable relationship(s) on {param.name!r}")
+            return ValidationResult(None, False,
+                                    f"unresolvable relationship(s) on {param.name!r}")
         param.relationships = kept
 
     spec.params = validated
+    try:
+        dependency_order(validated)
+    except ValueError as exc:
+        return ValidationResult(None, False, str(exc))
 
     essential = [p for p in validated
                  if p.required and p.call_kind not in ("var_positional", "var_keyword")]

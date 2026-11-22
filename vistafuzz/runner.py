@@ -9,8 +9,8 @@ from dataclasses import dataclass, field
 from typing import Any, Iterable
 
 from . import llm as llm_mod
-from . import reproducer
-from .collector import ApiRecord, collect, collect_api
+from . import coverage_support, direct, generation, reproducer
+from .collector import ApiRecord, collect, collect_api, signature_params
 from .extraction import extract
 from .models import ApiSpec, Finding
 from .oracles import crash_verdict, is_resource_exhaustion
@@ -31,10 +31,17 @@ class RunConfig:
     max_depth: int = 3
     include: str = ""
     numeric_only: bool = True
-    methods: bool = True
+    methods: bool = False
     apis: list[str] = field(default_factory=list)
     save_reproducers: bool = True
     llm: llm_mod.LLMConfig | None = None
+    spec_dir: str = ""
+    variant: str = "full"
+    prompt_input: str = "doc+sig"
+    python_coverage: bool = False
+    native_coverage: str = ""
+    native_build_dir: str = ""
+    generator: str = "paramspec"
 
 
 @dataclass
@@ -48,6 +55,9 @@ class ApiOutcome:
     oracle_hits: int = 0
     findings: list[Finding] = field(default_factory=list)
     extractor: str = ""
+    has_relationship: bool = False
+    preprocessing_sec: float = 0.0
+    signature_source: str = ""
 
     @property
     def srg(self) -> float:
@@ -101,27 +111,49 @@ def _finding(api: str, spec: ApiSpec, row: dict[str, Any]) -> Finding:
         receiver_path=spec.receiver_path,
         receiver_args=_mark_keyword_flags(row.get("receiver_args", {}),
                                           spec.receiver_params),
-        receiver_order=_order(spec.receiver_params))
+        receiver_order=_order(spec.receiver_params), doc=spec.doc,
+        constraints_satisfied=row.get("constraints_satisfied", False))
 
 
 def run_api(record: ApiRecord, config: RunConfig, work_dir: str) -> ApiOutcome:
-    spec = extract(record, extractor=config.extractor, config=config.llm)
-    result = validate(spec, record)
-    if not result.ok or result.spec is None:
-        return ApiOutcome(record.api, "excluded", result.reason, extractor=spec.extractor)
-    spec = result.spec
+    zero_argument_method = (record.is_method and record.signature is not None
+                            and all(name in ("self", "cls") for name in record.signature.parameters))
+    if not record.doc.strip() or not signature_params(record) and not zero_argument_method:
+        return ApiOutcome(record.api, "excluded", "no usable documentation or signature")
+    started = time.monotonic()
+    cache_dir = config.spec_dir or os.path.join(config.out_dir, "specs")
+    generator_path = ""
+    if config.generator == "llm-direct":
+        spec, generator_path = direct.prepare(record, config.llm or llm_mod.LLMConfig.from_env(), cache_dir)
+    else:
+        spec = extract(record, extractor=config.extractor, config=config.llm,
+                       cache_dir=cache_dir, prompt_input=config.prompt_input)
+    if config.generator != "llm-direct" and "validation" not in generation.VARIANTS[config.variant]:
+        result = validate(spec, record)
+        if not result.ok or result.spec is None:
+            return ApiOutcome(record.api, "excluded", result.reason, extractor=spec.extractor,
+                              preprocessing_sec=time.monotonic() - started)
+        spec = result.spec
+    preprocessing_sec = time.monotonic() - started
 
     api_slug = record.api.replace(".", "_")
     events_path = os.path.join(work_dir, f"{api_slug}.events.jsonl")
+    with open(events_path, "w"):
+        pass
     job_path = os.path.join(work_dir, f"{api_slug}.job.json")
     with open(job_path, "w") as handle:
         json.dump({"api": record.api, "spec": spec.to_json(),
                    "budget_sec": config.budget_sec, "case_timeout": config.case_timeout,
                    "max_cases": config.max_cases or 0, "seed": config.seed,
                    "max_findings": config.max_findings_per_api,
+                   "variant": config.variant,
+                   "generator_path": generator_path,
                    "events_path": events_path}, handle, default=repr)
 
-    outcome = ApiOutcome(record.api, "tested", extractor=spec.extractor)
+    outcome = ApiOutcome(record.api, "tested", extractor=spec.extractor,
+                         has_relationship=any(p.relationships for p in spec.params),
+                         preprocessing_sec=preprocessing_sec,
+                         signature_source=record.signature_source)
     hard_limit = config.budget_sec + config.case_timeout + 60
     package_parent = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     env = {**os.environ, "PYTHONWARNINGS": "ignore",
@@ -131,7 +163,9 @@ def run_api(record: ApiRecord, config: RunConfig, work_dir: str) -> ApiOutcome:
     returncode = 0
     stderr = ""
     try:
-        proc = subprocess.run([sys.executable, "-m", "vistafuzz.worker", job_path],
+        command = coverage_support.worker_command(
+            job_path, config.lib, os.path.join(config.out_dir, "coverage") if config.python_coverage else "")
+        proc = subprocess.run(command,
                               capture_output=True, text=True, env=env,
                               timeout=hard_limit, check=False)
         returncode, stderr = proc.returncode, proc.stderr or ""
@@ -153,7 +187,7 @@ def run_api(record: ApiRecord, config: RunConfig, work_dir: str) -> ApiOutcome:
             pending_start = None
             outcome.cases = max(outcome.cases, int(row.get("case", 0)))
             status = row.get("status")
-            if status == "executed":
+            if status in ("executed", "unexpected_exception", "hang"):
                 outcome.executed += 1
             elif status == "rejected":
                 outcome.rejected += 1
@@ -170,12 +204,15 @@ def run_api(record: ApiRecord, config: RunConfig, work_dir: str) -> ApiOutcome:
     if verdict and pending_start is not None and is_resource_exhaustion(stderr):
         pass
     elif verdict and pending_start is not None:
+        outcome.executed += 1
+        outcome.cases = max(outcome.cases, pending_start.get("case", 0))
         kind, detail = verdict
         tail = stderr.strip().splitlines()[-3:]
         row = dict(pending_start)
         row.update({"oracle": "crash", "kind": kind,
                     "detail": detail + (("\n" + "\n".join(tail)) if tail else "")})
         outcome.findings.append(_finding(record.api, spec, row))
+        outcome.oracle_hits += 1
     elif verdict and pending_start is None and not rows:
         outcome.status = "error"
         outcome.reason = f"worker failed before any case ({verdict[1]})"
@@ -183,11 +220,15 @@ def run_api(record: ApiRecord, config: RunConfig, work_dir: str) -> ApiOutcome:
 
 
 def run(config: RunConfig) -> dict[str, Any]:
+    if config.variant not in generation.VARIANTS:
+        raise ValueError(f"unknown variant: {config.variant}")
     os.makedirs(config.out_dir, exist_ok=True)
     work_dir = os.path.join(config.out_dir, "work")
     repro_dir = os.path.join(config.out_dir, "reproducers")
     os.makedirs(work_dir, exist_ok=True)
     os.makedirs(repro_dir, exist_ok=True)
+    if config.native_build_dir:
+        coverage_support.reset_native(config.native_build_dir)
 
     if config.apis:
         records = [r for r in (collect_api(a) for a in config.apis) if r is not None]
@@ -228,6 +269,9 @@ def run(config: RunConfig) -> dict[str, Any]:
     summary = {
         "library": config.lib,
         "extractor": config.extractor,
+        "variant": config.variant,
+        "prompt_input": config.prompt_input,
+        "generator": config.generator,
         "budget_sec_per_api": config.budget_sec,
         "apis_discovered": len(records),
         "apis_method_based": len([r for r in records if r.is_method]),
@@ -236,7 +280,8 @@ def run(config: RunConfig) -> dict[str, Any]:
         "apis_excluded": len([o for o in outcomes if o.status == "excluded"]),
         "apis_skipped": len([o for o in outcomes if o.status == "skipped"]),
         "apis_error": len([o for o in outcomes if o.status == "error"]),
-        "cases_generated": sum(o.cases for o in outcomes),
+        "generation_attempts": sum(o.cases for o in outcomes),
+        "cases_generated": executed + rejected,
         "cases_executed": executed,
         "cases_rejected": rejected,
         "valid_generation_rate_pct": round(100.0 * executed / (executed + rejected), 2)
@@ -248,14 +293,38 @@ def run(config: RunConfig) -> dict[str, Any]:
             "nan": sum(1 for o in outcomes for f in o.findings if f.oracle == "nan"),
         },
         "elapsed_sec": round(time.time() - started, 1),
+        "preprocessing_sec": round(sum(o.preprocessing_sec for o in outcomes), 4),
+        "relationship_prevalence_pct": round(100 * sum(o.has_relationship for o in tested) / len(records), 2)
+        if records else 0.0,
+        "extraction_success_rate_pct": round(100 * len(tested) / len(records), 2) if records else 0.0,
     }
+    summary["vgr_by_relationship"] = {}
+    for label, present in (("R+", True), ("R-", False)):
+        cohort = [o for o in tested if o.has_relationship == present]
+        accepted = sum(o.executed for o in cohort)
+        total = accepted + sum(o.rejected for o in cohort)
+        summary["vgr_by_relationship"][label] = {
+            "apis": len(cohort), "executed": accepted, "generated": total,
+            "vgr_pct": round(100 * accepted / total, 2) if total else 0.0}
+    native_file = config.native_coverage
+    if config.native_build_dir:
+        native_file = coverage_support.capture_native(
+            config.native_build_dir, os.path.join(config.out_dir, "coverage", "native.info"))
+    if config.python_coverage or native_file:
+        summary["coverage"] = coverage_support.summarize(
+            os.path.join(config.out_dir, "coverage") if config.python_coverage else "",
+            native_file)
     with open(os.path.join(config.out_dir, "summary.json"), "w") as handle:
         json.dump(summary, handle, indent=2)
     with open(os.path.join(config.out_dir, "apis.jsonl"), "w") as handle:
         for outcome in outcomes:
             handle.write(json.dumps({
                 "api": outcome.api, "status": outcome.status, "reason": outcome.reason,
-                "cases": outcome.cases, "executed": outcome.executed,
+                "cases": outcome.executed + outcome.rejected, "executed": outcome.executed,
+                "generation_attempts": outcome.cases,
+                "has_relationship": outcome.has_relationship,
+                "signature_source": outcome.signature_source,
+                "preprocessing_sec": round(outcome.preprocessing_sec, 4),
                 "rejected": outcome.rejected, "srg_pct": round(outcome.srg, 2),
                 "oracle_hits": outcome.oracle_hits,
                 "findings": len(outcome.findings), "extractor": outcome.extractor,

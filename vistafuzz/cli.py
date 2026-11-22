@@ -8,6 +8,7 @@ import sys
 from . import llm as llm_mod
 from .collector import collect, collect_api
 from .extraction import extract
+from .generation import VARIANTS
 from .runner import RunConfig, run
 from .validation import validate
 
@@ -24,17 +25,19 @@ def _llm_config(args: argparse.Namespace) -> llm_mod.LLMConfig:
 def _add_llm_flags(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--extractor", choices=["llm", "signature"], default="llm",
                         help="llm: prompt the model (default); "
-                             "signature: offline fallback, no LLM required")
+                             "signature: explicit offline diagnostic, no LLM required")
     parser.add_argument("--llm-backend", default="", choices=["", "ollama", "openai"])
     parser.add_argument("--llm-model", default="", help="e.g. qwen2.5-coder:32b")
     parser.add_argument("--llm-host", default="", help="ollama host URL")
     parser.add_argument("--llm-base-url", default="", help="OpenAI-compatible base URL")
+    parser.add_argument("--spec-dir", default="", help="persistent extraction cache")
+    parser.add_argument("--prompt-input", choices=["doc+sig", "doc-only", "sig-only"], default="doc+sig")
 
 
 def cmd_apis(args: argparse.Namespace) -> int:
     records = collect(args.lib, max_depth=args.max_depth, limit=args.limit,
                       numeric_only=not args.all, include=args.include,
-                      methods=not args.no_methods)
+                      methods=args.methods and not args.no_methods)
     for record in records:
         marker = "  [method]" if record.is_method else ""
         print(f"{record.api}{record.signature_text}{marker}")
@@ -47,7 +50,8 @@ def cmd_extract(args: argparse.Namespace) -> int:
     if record is None:
         print(f"cannot resolve {args.api}", file=sys.stderr)
         return 2
-    spec = extract(record, extractor=args.extractor, config=_llm_config(args))
+    spec = extract(record, extractor=args.extractor, config=_llm_config(args),
+                   cache_dir=args.spec_dir, prompt_input=args.prompt_input)
     result = validate(spec, record)
     payload = {
         "validated": result.ok,
@@ -68,8 +72,18 @@ def cmd_extract(args: argparse.Namespace) -> int:
 
 
 def cmd_fuzz(args: argparse.Namespace) -> int:
+    apis = list(args.api or [])
+    if args.api_list:
+        with open(args.api_list) as handle:
+            payload = handle.read()
+        try:
+            values = json.loads(payload)
+            values = values.get("apis", []) if isinstance(values, dict) else values
+        except json.JSONDecodeError:
+            values = [line.strip() for line in payload.splitlines() if line.strip()]
+        apis.extend(row["api"] if isinstance(row, dict) else row for row in values)
     config = RunConfig(
-        lib=args.lib or (args.api[0].split(".")[0] if args.api else ""),
+        lib=args.lib or (apis[0].split(".")[0] if apis else ""),
         out_dir=args.out,
         budget_sec=args.budget,
         case_timeout=args.case_timeout,
@@ -81,16 +95,51 @@ def cmd_fuzz(args: argparse.Namespace) -> int:
         max_depth=args.max_depth,
         include=args.include,
         numeric_only=not args.all,
-        methods=not args.no_methods,
-        apis=list(args.api or []),
+        methods=args.methods and not args.no_methods,
+        apis=list(dict.fromkeys(apis)),
         save_reproducers=not args.no_reproducers,
         llm=_llm_config(args),
+        spec_dir=args.spec_dir,
+        variant=args.variant,
+        prompt_input=args.prompt_input,
+        python_coverage=args.coverage,
+        native_coverage=args.native_coverage,
+        native_build_dir=args.native_build_dir,
+        generator=args.generator,
     )
     if not config.lib:
         print("either --lib or --api is required", file=sys.stderr)
         return 2
-    summary = run(config)
+    if args.benchmark:
+        from .benchmark import run_benchmark
+
+        summary = run_benchmark(config, args.benchmark, args.repeat)
+    elif args.repeat > 1 or args.variants or args.budgets:
+        from .experiments import run_repeated
+
+        summary = run_repeated(config, args.repeat,
+                               args.variants.split(",") if args.variants else None,
+                               [float(x) for x in args.budgets.split(",")] if args.budgets else None)
+    else:
+        summary = run(config)
     print(json.dumps(summary, indent=2))
+    return 0
+
+
+def cmd_common(args):
+    from .experiments import common_apis
+
+    values = common_apis(args.inputs)
+    with open(args.out, "w") as handle:
+        json.dump(values, handle, indent=2)
+    print(f"wrote {len(values)} common APIs to {args.out}")
+    return 0
+
+
+def cmd_bugs(args):
+    from .issue_stats import markdown, summarize
+
+    print(markdown(summarize(args.file)))
     return 0
 
 
@@ -124,6 +173,7 @@ def build_parser() -> argparse.ArgumentParser:
     apis.add_argument("--all", action="store_true", help="skip the numeric-API filter")
     apis.add_argument("--no-methods", action="store_true",
                       help="only module-level functions; skip class methods")
+    apis.add_argument("--methods", action="store_true", help="include receiver construction outside the paper protocol")
     apis.set_defaults(func=cmd_apis)
 
     ext = sub.add_parser("extract", help="extract and validate one API's ParamSpecs")
@@ -135,6 +185,8 @@ def build_parser() -> argparse.ArgumentParser:
     fuzz = sub.add_parser("fuzz", help="run the full workflow over a library")
     fuzz.add_argument("--lib", default="")
     fuzz.add_argument("--api", action="append", help="fuzz only this API (repeatable)")
+    fuzz.add_argument("--api-list", default="", help="JSON or text manifest of target APIs")
+    fuzz.add_argument("--benchmark", default="", help="known-bug manifest with per-bug validators")
     fuzz.add_argument("--out", required=True)
     fuzz.add_argument("--budget", type=float, default=60.0,
                       help="per-API testing budget in seconds (default 60)")
@@ -151,6 +203,15 @@ def build_parser() -> argparse.ArgumentParser:
     fuzz.add_argument("--no-methods", action="store_true",
                       help="only module-level functions; skip class methods")
     fuzz.add_argument("--no-reproducers", action="store_true")
+    fuzz.add_argument("--methods", action="store_true", help="include receiver construction outside the paper protocol")
+    fuzz.add_argument("--variant", choices=list(VARIANTS), default="full")
+    fuzz.add_argument("--variants", default="", help="comma-separated ablation variants")
+    fuzz.add_argument("--budgets", default="", help="comma-separated budgets in seconds")
+    fuzz.add_argument("--repeat", type=int, default=1)
+    fuzz.add_argument("--coverage", action="store_true", help="measure Python coverage in API workers")
+    fuzz.add_argument("--native-coverage", default="", help="LCOV trace from an instrumented native build")
+    fuzz.add_argument("--native-build-dir", default="", help="reset and collect GCOV counters through LCOV")
+    fuzz.add_argument("--generator", choices=["paramspec", "llm-direct"], default="paramspec")
     _add_llm_flags(fuzz)
     fuzz.set_defaults(func=cmd_fuzz)
 
@@ -158,6 +219,13 @@ def build_parser() -> argparse.ArgumentParser:
     report.add_argument("--out", required=True)
     report.add_argument("--limit", type=int, default=20)
     report.set_defaults(func=cmd_report)
+    common = sub.add_parser("common", help="write the intersection of supported APIs")
+    common.add_argument("inputs", nargs="+", help="per-tool apis.jsonl files")
+    common.add_argument("--out", required=True)
+    common.set_defaults(func=cmd_common)
+    bugs = sub.add_parser("bugs", help="summarize the issue ledger using the paper's columns")
+    bugs.add_argument("--file", default="bug_review.csv")
+    bugs.set_defaults(func=cmd_bugs)
     return parser
 
 

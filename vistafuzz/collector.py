@@ -10,6 +10,7 @@ from typing import Any, Iterator
 
 from .models import (CALL_KEYWORD, CALL_POSITIONAL, CALL_POSITIONAL_OR_KEYWORD,
                      CALL_VAR_KEYWORD, CALL_VAR_POSITIONAL)
+from .adapters import canonical_library, get_adapter
 
 _EXCLUDE_TOKENS = frozenset({
     "save", "load", "read", "write", "download", "fetch", "dump", "export",
@@ -61,6 +62,7 @@ class ApiRecord:
     receiver_doc: str = ""
     receiver_signature_text: str = ""
     receiver_signature: "inspect.Signature | None" = None
+    signature_source: str = ""
 
 
 def receiver_record(record: "ApiRecord") -> "ApiRecord | None":
@@ -232,11 +234,9 @@ def doc_signature_line(doc: str) -> str:
 
 
 def describe(obj: Any) -> tuple[str, inspect.Signature | None]:
-    doc = inspect.getdoc(obj) or ""
-    try:
-        sig = inspect.signature(obj)
-    except (TypeError, ValueError):
-        sig = None
+    adapter = get_adapter(getattr(obj, "__module__", "numpy") or "numpy")
+    doc = adapter.documentation(obj)
+    sig = adapter.signature(obj)
     if not _is_opaque(sig):
         return str(sig), sig
     line = doc_signature_line(doc)
@@ -246,6 +246,8 @@ def describe(obj: Any) -> tuple[str, inspect.Signature | None]:
 
 
 def collect_api(api: str) -> ApiRecord | None:
+    root, separator, tail = api.partition(".")
+    api = canonical_library(root) + separator + tail
     obj = resolve(api)
     if obj is None or not callable(obj):
         return None
@@ -257,7 +259,8 @@ def collect_api(api: str) -> ApiRecord | None:
     doc = inspect.getdoc(obj) or ""
     sig_text, sig = describe(obj)
     return ApiRecord(api=api, obj=obj, doc=doc, signature_text=sig_text,
-                     signature=sig, module=owner_path)
+                     signature=sig, module=owner_path,
+                     signature_source=signature_source(sig, sig_text))
 
 
 def resolve(path: str) -> Any:
@@ -366,7 +369,8 @@ def _iter_class_methods(module: str, cls: Any, class_path: str,
 
 def collect(lib: str, *, max_depth: int = 3, limit: int | None = None,
             numeric_only: bool = True, include: str = "",
-            exclude_filters: bool = True, methods: bool = True) -> list[ApiRecord]:
+            exclude_filters: bool = True, methods: bool = False) -> list[ApiRecord]:
+    lib = canonical_library(lib)
     seen: set[int] = set()
     out: list[ApiRecord] = []
     pattern = re.compile(include) if include else None
@@ -419,10 +423,19 @@ def collect(lib: str, *, max_depth: int = 3, limit: int | None = None,
             seen.add(id(obj))
             out.append(ApiRecord(api=qualname, obj=obj, doc=doc,
                                  signature_text=sig_text, signature=sig,
-                                 module=mod_name))
+                                 module=mod_name,
+                                 signature_source=signature_source(sig, sig_text)))
             if limit and len(out) >= limit:
                 return out
     return out
+
+
+def signature_source(sig, text):
+    if sig is not None and not _is_opaque(sig):
+        return "runtime"
+    if parse_doc_signature(text):
+        return "binding_doc"
+    return "unavailable"
 
 
 def signature_params(record: ApiRecord) -> list[dict[str, Any]]:

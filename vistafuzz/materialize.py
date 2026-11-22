@@ -1,68 +1,22 @@
 from __future__ import annotations
 
-import importlib
 from typing import Any
 
 import numpy as np
 
+from .adapters import get_adapter
 from .models import CALL_KEYWORD, CALL_POSITIONAL, CALL_POSITIONAL_OR_KEYWORD, ParamSpec, Value
-
-_ARRAY_CTORS = ("asarray", "array", "tensor", "as_tensor", "to_tensor",
-                "constant", "Tensor", "from_numpy")
-_DTYPE_ALIASES = {"float64": ("float64", "double", "float_"),
-                  "float32": ("float32", "float", "single"),
-                  "float16": ("float16", "half"),
-                  "int64": ("int64", "long", "int_"),
-                  "int32": ("int32", "int"),
-                  "int16": ("int16", "short"),
-                  "uint8": ("uint8", "ubyte"),
-                  "bool": ("bool_", "bool", "boolean")}
-
 
 def library_root(api: str) -> str:
     return api.split(".", 1)[0]
 
 
-def _module(root: str):
-    try:
-        return importlib.import_module(root)
-    except Exception:
-        return None
-
-
 def native_dtype(root: str, name: str) -> Any:
-    mod = _module(root)
-    for alias in _DTYPE_ALIASES.get(name, (name,)):
-        candidate = getattr(mod, alias, None) if mod is not None else None
-        if candidate is not None and not callable(candidate) or _is_dtype_like(candidate):
-            return candidate
-    return getattr(np, name, None)
-
-
-def _is_dtype_like(obj: Any) -> bool:
-    if obj is None:
-        return False
-    text = f"{type(obj).__module__}.{type(obj).__name__}".lower()
-    return "dtype" in text or "type" in type(obj).__name__.lower()
+    return get_adapter(root).dtype(name)
 
 
 def to_native_array(root: str, arr: np.ndarray, dtype_name: str | None) -> Any:
-    mod = _module(root)
-    if mod is None or root == "numpy":
-        return arr
-    dtype = native_dtype(root, dtype_name) if dtype_name else None
-    for name in _ARRAY_CTORS:
-        ctor = getattr(mod, name, None)
-        if not callable(ctor):
-            continue
-        for kwargs in ([{"dtype": dtype}] if dtype is not None else []) + [{}]:
-            try:
-                out = ctor(arr, **kwargs)
-            except Exception:
-                continue
-            if out is not None:
-                return out
-    return arr
+    return get_adapter(root).array(arr, dtype_name)
 
 
 def materialize_value(root: str, value: Value) -> Any:

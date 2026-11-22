@@ -116,6 +116,9 @@ class ApiSpec:
     is_method: bool = False
     receiver_path: str = ""
     receiver_params: list[ParamSpec] = field(default_factory=list)
+    signature_source: str = ""
+    prompt_input: str = "doc+sig"
+    documentation_truncated: bool = False
 
     def param(self, name: str) -> ParamSpec | None:
         for p in self.params:
@@ -134,6 +137,9 @@ class ApiSpec:
             "is_method": self.is_method,
             "receiver_path": self.receiver_path,
             "receiver_params": [p.to_json() for p in self.receiver_params],
+            "signature_source": self.signature_source,
+            "prompt_input": self.prompt_input,
+            "documentation_truncated": self.documentation_truncated,
         }
 
     @classmethod
@@ -149,6 +155,9 @@ class ApiSpec:
             receiver_path=data.get("receiver_path", ""),
             receiver_params=[ParamSpec.from_json(p)
                              for p in data.get("receiver_params", [])],
+            signature_source=data.get("signature_source", ""),
+            prompt_input=data.get("prompt_input", "doc+sig"),
+            documentation_truncated=bool(data.get("documentation_truncated", False)),
         )
 
 
@@ -187,6 +196,8 @@ class Finding:
     receiver_path: str = ""
     receiver_args: dict[str, Any] = field(default_factory=dict)
     receiver_order: list[str] = field(default_factory=list)
+    doc: str = ""
+    constraints_satisfied: bool = False
 
     def to_json(self) -> dict[str, Any]:
         return asdict(self)

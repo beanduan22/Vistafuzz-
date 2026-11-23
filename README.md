@@ -7,7 +7,7 @@ Use Python 3.9 or newer. Install each target library in the Python environment u
 ```bash
 git clone https://github.com/beanduan22/Vistafuzz-.git
 cd Vistafuzz-
-python -m pip install -e ".[dev,coverage]"
+python -m pip install -e ".[coverage]"
 python -m pip install numpy scipy
 ```
 
@@ -55,18 +55,4 @@ Run repeated campaigns with coverage or component variants:
 ```bash
 python -m vistafuzz.cli fuzz --lib numpy --out runs/repeated --spec-dir specs --budget 60 --repeat 5 --coverage
 python -m vistafuzz.cli fuzz --lib numpy --out runs/variants --spec-dir specs --budget 60 --repeat 5 --variants full,noT,noS,noRand,noBound,noNF,noRel,noVal --coverage
-```
-
-Run smoke checks with the target library's Python interpreter:
-
-```bash
-python scripts/check_runtime.py --lib numpy --out runs/smoke/numpy.json
-KERAS_BACKEND=torch KERAS_TORCH_DEVICE=cpu python scripts/check_runtime.py --lib keras --out runs/smoke/keras-torch.json
-bash examples/oneflow_cpu_smoke.sh /path/to/oneflow-env/bin/python runs/smoke/oneflow.json
-```
-
-Run tests:
-
-```bash
-PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest tests -q
 ```

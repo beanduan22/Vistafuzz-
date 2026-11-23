@@ -25,7 +25,7 @@ def _llm_config(args: argparse.Namespace) -> llm_mod.LLMConfig:
 def _add_llm_flags(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--extractor", choices=["llm", "signature"], default="llm",
                         help="llm: prompt the model (default); "
-                             "signature: explicit offline diagnostic, no LLM required")
+                             "signature: extract from signatures without an LLM")
     parser.add_argument("--llm-backend", default="", choices=["", "ollama", "openai"])
     parser.add_argument("--llm-model", default="", help="e.g. qwen2.5-coder:32b")
     parser.add_argument("--llm-host", default="", help="ollama host URL")
@@ -34,7 +34,7 @@ def _add_llm_flags(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--prompt-input", choices=["doc+sig", "doc-only", "sig-only"], default="doc+sig")
     parser.add_argument("--signature-policy", choices=["runtime", "documented"], default="runtime",
                         help="runtime: require independently introspectable calling information; "
-                             "documented: exploratory use of binding docstrings")
+                             "documented: use binding docstrings")
 
 
 def cmd_apis(args: argparse.Namespace) -> int:
@@ -158,13 +158,6 @@ def cmd_triage(args):
     return 0
 
 
-def cmd_adaptation(args):
-    from .runtime_stats import measure
-
-    print(json.dumps(measure(), indent=2))
-    return 0
-
-
 def cmd_report(args: argparse.Namespace) -> int:
     path = os.path.join(args.out, "summary.json")
     if not os.path.exists(path):
@@ -195,7 +188,7 @@ def build_parser() -> argparse.ArgumentParser:
     apis.add_argument("--all", action="store_true", help="skip the numeric-API filter")
     apis.add_argument("--no-methods", action="store_true",
                       help="only module-level functions; skip class methods")
-    apis.add_argument("--methods", action="store_true", help="include receiver construction outside the paper protocol")
+    apis.add_argument("--methods", action="store_true", help="include class methods and receiver construction")
     apis.set_defaults(func=cmd_apis)
 
     ext = sub.add_parser("extract", help="extract and validate one API's ParamSpecs")
@@ -225,7 +218,7 @@ def build_parser() -> argparse.ArgumentParser:
     fuzz.add_argument("--no-methods", action="store_true",
                       help="only module-level functions; skip class methods")
     fuzz.add_argument("--no-reproducers", action="store_true")
-    fuzz.add_argument("--methods", action="store_true", help="include receiver construction outside the paper protocol")
+    fuzz.add_argument("--methods", action="store_true", help="include class methods and receiver construction")
     fuzz.add_argument("--variant", choices=list(VARIANTS), default="full")
     fuzz.add_argument("--variants", default="", help="comma-separated ablation variants")
     fuzz.add_argument("--budgets", default="", help="comma-separated budgets in seconds")
@@ -245,7 +238,7 @@ def build_parser() -> argparse.ArgumentParser:
     common.add_argument("inputs", nargs="+", help="per-tool apis.jsonl files")
     common.add_argument("--out", required=True)
     common.set_defaults(func=cmd_common)
-    bugs = sub.add_parser("bugs", help="summarize the issue ledger using the paper's columns")
+    bugs = sub.add_parser("bugs", help="summarize issue status by library")
     bugs.add_argument("--file", default="bug_review.csv")
     bugs.set_defaults(func=cmd_bugs)
     triage = sub.add_parser("triage", help="record documentation-checked, minimized findings for reporting")
@@ -253,8 +246,6 @@ def build_parser() -> argparse.ArgumentParser:
     triage.add_argument("--decisions", required=True, help="manual review decisions in JSON")
     triage.add_argument("--out", required=True)
     triage.set_defaults(func=cmd_triage)
-    adaptation = sub.add_parser("adaptation", help="measure dedicated runtime source lines")
-    adaptation.set_defaults(func=cmd_adaptation)
     return parser
 
 

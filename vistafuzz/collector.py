@@ -10,7 +10,7 @@ from typing import Any, Iterator
 
 from .models import (CALL_KEYWORD, CALL_POSITIONAL, CALL_POSITIONAL_OR_KEYWORD,
                      CALL_VAR_KEYWORD, CALL_VAR_POSITIONAL)
-from .adapters import canonical_library, get_adapter
+from .native import canonical_library, get_runtime
 
 _EXCLUDE_TOKENS = frozenset({
     "save", "load", "read", "write", "download", "fetch", "dump", "export",
@@ -215,8 +215,8 @@ def _is_opaque(sig: inspect.Signature | None) -> bool:
     if sig is None:
         return True
     kinds = {p.kind for p in sig.parameters.values()}
-    return not kinds or kinds <= {inspect.Parameter.VAR_POSITIONAL,
-                                  inspect.Parameter.VAR_KEYWORD}
+    return bool(kinds) and kinds <= {inspect.Parameter.VAR_POSITIONAL,
+                                    inspect.Parameter.VAR_KEYWORD}
 
 
 _DOC_SIG_LINE_RE = re.compile(r"^\s*[\w.]+\s*\(.*\)\s*$")
@@ -233,10 +233,10 @@ def doc_signature_line(doc: str) -> str:
     return ""
 
 
-def describe(obj: Any) -> tuple[str, inspect.Signature | None]:
-    adapter = get_adapter(getattr(obj, "__module__", "numpy") or "numpy")
-    doc = adapter.documentation(obj)
-    sig = adapter.signature(obj)
+def describe(obj: Any, library: str = "") -> tuple[str, inspect.Signature | None]:
+    runtime = get_runtime(library or getattr(obj, "__module__", "numpy") or "numpy")
+    doc = runtime.documentation(obj)
+    sig = runtime.signature(obj)
     if not _is_opaque(sig):
         return str(sig), sig
     line = doc_signature_line(doc)
@@ -256,8 +256,8 @@ def collect_api(api: str) -> ApiRecord | None:
     if isinstance(owner, type):
         return _method_record(owner_path.rsplit(".", 1)[0], owner, owner_path,
                               api.rsplit(".", 1)[1], obj)
-    doc = inspect.getdoc(obj) or ""
-    sig_text, sig = describe(obj)
+    doc = get_runtime(api).documentation(obj)
+    sig_text, sig = describe(obj, api)
     return ApiRecord(api=api, obj=obj, doc=doc, signature_text=sig_text,
                      signature=sig, module=owner_path,
                      signature_source=signature_source(sig, sig_text))
@@ -329,17 +329,19 @@ def _class_is_testable(cls: Any, name: str) -> bool:
 
 def _method_record(module: str, cls: Any, class_path: str, name: str,
                    fn: Any) -> "ApiRecord | None":
-    doc = inspect.getdoc(fn) or ""
-    sig_text, sig = describe(fn)
+    runtime = get_runtime(class_path)
+    doc = runtime.documentation(fn)
+    sig_text, sig = describe(fn, class_path)
     if not doc or not sig_text:
         return None
-    ctor_text, ctor_sig = describe(cls)
+    ctor_text, ctor_sig = describe(cls, class_path)
     return ApiRecord(api=f"{class_path}.{name}", obj=fn, doc=doc,
                      signature_text=sig_text, signature=sig, module=module,
                      is_method=True, cls=cls, class_path=class_path,
-                     receiver_doc=inspect.getdoc(cls) or "",
+                     receiver_doc=runtime.documentation(cls),
                      receiver_signature_text=ctor_text,
-                     receiver_signature=ctor_sig)
+                     receiver_signature=ctor_sig,
+                     signature_source=signature_source(sig, sig_text))
 
 
 def _iter_class_methods(module: str, cls: Any, class_path: str,
@@ -412,8 +414,8 @@ def collect(lib: str, *, max_depth: int = 3, limit: int | None = None,
                 continue
             if id(obj) in seen:
                 continue
-            doc = inspect.getdoc(obj) or ""
-            sig_text, sig = describe(obj)
+            doc = get_runtime(lib).documentation(obj)
+            sig_text, sig = describe(obj, lib)
             if not doc or not sig_text:
                 continue
             if sig is not None and not sig.parameters:
@@ -438,6 +440,10 @@ def signature_source(sig, text):
     return "unavailable"
 
 
+def has_runtime_signature(record: ApiRecord) -> bool:
+    return not _is_opaque(record.signature)
+
+
 def signature_params(record: ApiRecord) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     if _is_opaque(record.signature):
@@ -446,7 +452,7 @@ def signature_params(record: ApiRecord) -> list[dict[str, Any]]:
     if record.signature is None:
         return rows
     for pos, (name, par) in enumerate(record.signature.parameters.items()):
-        if name in ("self", "cls"):
+        if record.is_method and name in ("self", "cls"):
             continue
         has_default = par.default is not inspect.Parameter.empty
         rows.append({

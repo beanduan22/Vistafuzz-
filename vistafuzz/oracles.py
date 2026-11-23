@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import ast
+import doctest
 import re
+from functools import lru_cache
 from typing import Any
 
 import numpy as np
@@ -68,10 +71,10 @@ def _iter_numeric(obj: Any, depth: int = 0, include_bool: bool = False, _seen=No
     if obj is None or depth > 32:
         return
     if _seen is None:
-        _seen = set()
+        _seen = {}
     if id(obj) in _seen:
         return
-    _seen.add(id(obj))
+    _seen[id(obj)] = obj
     if isinstance(obj, (bool, np.bool_)):
         if include_bool:
             yield np.asarray(obj)
@@ -88,7 +91,7 @@ def _iter_numeric(obj: Any, depth: int = 0, include_bool: bool = False, _seen=No
         for item in values:
             yield from _iter_numeric(item, depth + 1, include_bool, _seen)
         return
-    for attr in ("detach", "cpu", "numpy", "asnumpy", "to_numpy", "array", "__array__"):
+    for attr in ("numpy", "asnumpy", "to_numpy", "array", "__array__", "cpu", "detach"):
         try:
             fn = getattr(obj, attr, None)
             converted = fn() if callable(fn) else fn
@@ -134,13 +137,127 @@ def _matching_mask(output, inputs, nan_only=False):
     return covered
 
 
-def check_nan(result: Any, inputs=None, doc: str = "") -> tuple[bool, str]:
+def _example_literal(node, variables):
+    if isinstance(node, ast.Constant) and isinstance(node.value, (int, float, complex, bool)):
+        return node.value
+    if isinstance(node, (ast.List, ast.Tuple)):
+        return [_example_literal(item, variables) for item in node.elts]
+    if isinstance(node, ast.Name):
+        if node.id in variables:
+            return variables[node.id]
+        constants = {"inf": np.inf, "nan": np.nan, "pi": np.pi, "e": np.e}
+        if node.id in constants:
+            return constants[node.id]
+    if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
+        if node.value.id in ("np", "numpy", "math", "jnp"):
+            return _example_literal(ast.Name(id=node.attr), {})
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.UAdd, ast.USub)):
+        value = _example_literal(node.operand, variables)
+        return -value if isinstance(node.op, ast.USub) else value
+    if isinstance(node, ast.BinOp):
+        left = _example_literal(node.left, variables)
+        right = _example_literal(node.right, variables)
+        if not isinstance(left, (int, float, complex)) or not isinstance(right, (int, float, complex)):
+            raise ValueError("non-scalar example arithmetic")
+        if isinstance(node.op, ast.Add):
+            return left + right
+        if isinstance(node.op, ast.Sub):
+            return left - right
+        if isinstance(node.op, ast.Mult):
+            return left * right
+        if isinstance(node.op, ast.Div):
+            return left / right
+        if isinstance(node.op, ast.Pow) and abs(right) <= 1024 and abs(left) <= 1e308:
+            return left ** right
+    if isinstance(node, ast.Call):
+        name = node.func.attr if isinstance(node.func, ast.Attribute) else getattr(node.func, "id", "")
+        allowed = {"array", "asarray", "tensor", "constant"}
+        if name in allowed and len(node.args) == 1 and not node.keywords:
+            return np.asarray(_example_literal(node.args[0], variables))
+    raise ValueError("example requires execution")
+
+
+@lru_cache(maxsize=128)
+def _documented_nonfinite_cases(doc, api):
+    if not doc or not api:
+        return ()
+    name = api.rsplit(".", 1)[-1]
+    elementwise = bool(re.search(r"element[- ]?wise|point[- ]?wise", doc, re.I))
+    variables, cases = {}, []
+    try:
+        examples = doctest.DocTestParser().get_examples(doc)
+    except ValueError:
+        return ()
+    for example in examples[:64]:
+        try:
+            statements = ast.parse(example.source).body
+            for statement in statements:
+                if isinstance(statement, ast.Assign) and len(statement.targets) == 1:
+                    target = statement.targets[0]
+                    if isinstance(target, ast.Name):
+                        variables.pop(target.id, None)
+                        try:
+                            variables[target.id] = _example_literal(statement.value, variables)
+                        except (ValueError, TypeError, ArithmeticError):
+                            pass
+            if len(statements) != 1 or not isinstance(statements[0], ast.Expr):
+                continue
+            call = statements[0].value
+            if not isinstance(call, ast.Call) or call.keywords or not call.args:
+                continue
+            called = call.func.attr if isinstance(call.func, ast.Attribute) else getattr(call.func, "id", "")
+            if called != name:
+                continue
+            inputs = [np.asarray(_example_literal(arg, variables)) for arg in call.args]
+            expected = np.asarray(_example_literal(ast.parse(example.want.strip(), mode="eval").body, {}))
+            if any(value.dtype.kind not in "biufc" for value in [*inputs, expected]):
+                continue
+            if not elementwise and any(value.ndim for value in [*inputs, expected]):
+                continue
+            broadcast = [np.broadcast_to(value, expected.shape) for value in inputs]
+            if expected.size > 4096:
+                continue
+            for index in np.flatnonzero(~np.isfinite(expected))[:64]:
+                arguments = tuple(value.flat[index].item() for value in broadcast)
+                cases.append((arguments, expected.flat[index].item(), elementwise))
+        except (SyntaxError, ValueError, TypeError, ArithmeticError, RecursionError):
+            continue
+    return tuple(cases)
+
+
+def _documented_masks(output, inputs, doc, api):
+    allowed = np.zeros(output.shape, dtype=bool)
+    missing = np.zeros(output.shape, dtype=bool)
+    for arguments, expected, elementwise in _documented_nonfinite_cases(doc, api):
+        if len(arguments) != len(inputs) or not elementwise and any(a.ndim for a in inputs):
+            continue
+        matches = np.ones(output.shape, dtype=bool)
+        for source, value in zip(inputs, arguments):
+            try:
+                source = np.broadcast_to(source, output.shape)
+            except ValueError:
+                matches[...] = False
+                break
+            matches &= (source == value) | (np.isnan(source) & np.isnan(value))
+        if np.isnan(expected):
+            correct = np.isnan(output)
+        else:
+            correct = output == expected
+        allowed |= matches & correct
+        missing |= matches & ~correct
+    return allowed, missing & ~allowed
+
+
+def check_nan(result: Any, inputs=None, doc: str = "", api: str = "") -> tuple[bool, str]:
     sources = [a for value in (inputs or []) for a in _iter_numeric(value)]
     outputs = list(_iter_numeric(result, include_bool=True))
     expects_nan = _nan_propagates(doc) and any(np.any(np.isnan(a)) for a in sources)
     for arr in outputs:
         if not arr.size:
             continue
+        documented, missing = _documented_masks(arr, sources, doc, api)
+        if np.any(missing):
+            return True, "output contradicts a documented non-finite input/output example"
         if expects_nan:
             for source in sources:
                 try:
@@ -152,7 +269,7 @@ def check_nan(result: Any, inputs=None, doc: str = "") -> tuple[bool, str]:
         bad_mask = ~np.isfinite(arr)
         if not np.any(bad_mask):
             continue
-        unexpected = bad_mask & ~_matching_mask(arr, sources)
+        unexpected = bad_mask & ~_matching_mask(arr, sources) & ~documented
         if np.any(unexpected):
             flat = np.asarray(arr)[unexpected]
             n_nan = int(np.count_nonzero(np.isnan(flat)))

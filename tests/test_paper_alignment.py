@@ -13,7 +13,7 @@ import numpy as np
 import pytest
 
 from vistafuzz import constraints, generation, oracles, relationships, reproducer, synth
-from vistafuzz.adapters import LIBRARIES, get_adapter
+from vistafuzz.native import LIBRARIES, get_runtime
 from vistafuzz.collector import ApiRecord, collect_api
 from vistafuzz.extraction import extract
 from vistafuzz.llm import LLMConfig
@@ -115,7 +115,7 @@ def test_reverse_order_dependency_chain_is_resolved():
 
 
 def test_cyclic_relationships_are_rejected_before_generation():
-    record = collect_api("numpy.add")
+    record = collect_api("numpy.array_equal")
     spec = extract(record, extractor="signature")
     spec.params[0].relationships = [Relationship("shape_follows", spec.params[1].name)]
     spec.params[1].relationships = [Relationship("shape_follows", spec.params[0].name)]
@@ -191,17 +191,17 @@ def test_prompt_input_ablation_masks_the_actual_api_context():
 
 
 @pytest.mark.parametrize("library", LIBRARIES)
-def test_library_adapters_are_explicit_and_lazy(library):
-    adapter = get_adapter(library)
-    assert adapter.root == library
-    assert callable(adapter.documentation)
-    assert callable(adapter.array)
+def test_library_runtimes_are_explicit_and_lazy(library):
+    runtime = get_runtime(library)
+    assert runtime.root == library
+    assert callable(runtime.documentation)
+    assert callable(runtime.array)
 
 
 @pytest.mark.parametrize("library", ["numpy", "scipy", "cv2", "torch"])
-def test_installed_native_adapters_preserve_shape_and_dtype(library):
+def test_installed_native_runtimes_preserve_shape_and_dtype(library):
     pytest.importorskip(library)
-    result = get_adapter(library).array(np.zeros((2, 3), dtype="float64"), "float64")
+    result = get_runtime(library).array(np.zeros((2, 3), dtype="float64"), "float64")
     assert tuple(result.shape) == (2, 3)
     assert "float64" in str(result.dtype)
 
@@ -257,8 +257,8 @@ def test_llm_direct_uses_one_model_call_and_the_same_worker(monkeypatch, tmp_pat
                        max_cases=3, budget_sec=1, spec_dir=str(tmp_path / "specs"))
     work = tmp_path / "work"
     work.mkdir()
-    first = run_api(collect_api("numpy.negative"), config, str(work))
-    second = run_api(collect_api("numpy.negative"), config, str(work))
+    first = run_api(collect_api("numpy.copy"), config, str(work))
+    second = run_api(collect_api("numpy.copy"), config, str(work))
     assert len(calls) == 1
     assert first.executed == 3
     assert second.executed == 3
@@ -277,7 +277,7 @@ def test_repeated_ablation_runs_keep_shared_extraction_and_distinct_outputs(tmp_
     from vistafuzz.experiments import run_repeated
 
     config = RunConfig(lib="numpy", out_dir=str(tmp_path), extractor="signature",
-                       apis=["numpy.negative"], max_cases=2, budget_sec=0.5)
+                       apis=["numpy.ndim"], max_cases=2, budget_sec=0.5)
     results = run_repeated(config, repeats=2, variants=["full", "noNF"])
     assert [r["variant"] for r in results] == ["full", "noNF"]
     assert all(r["apis_covered"]["runs"] == [1, 1] for r in results)

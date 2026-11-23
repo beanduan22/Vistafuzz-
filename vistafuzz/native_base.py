@@ -24,7 +24,7 @@ def resolve_object(path):
 
 
 @dataclass(frozen=True)
-class Adapter:
+class Runtime:
     root: str
     array_path: str
     dtype_path: str = "numpy"
@@ -56,14 +56,31 @@ class Adapter:
         dtype = self.dtype(dtype_name) if dtype_name else None
         array = np.asarray(value, dtype=dtype_name)
         out = ctor(array, dtype=dtype) if self.accepts_dtype else ctor(array)
-        if tuple(getattr(out, "shape", array.shape)) != array.shape:
+        return self.check_array(out, array, dtype_name)
+
+    def check_array(self, out, array, dtype_name):
+        shape = getattr(out, "shape", None)
+        if shape is None:
+            raise TypeError(f"{self.root} did not expose the materialized shape")
+        if tuple(shape) != array.shape:
             raise ValueError(f"{self.root} changed the generated shape")
         actual = getattr(out, "dtype", None)
-        if actual is not None and dtype_name and dtype_name not in str(actual):
+        if actual is None:
+            raise TypeError(f"{self.root} did not expose the materialized dtype")
+        expected = np.dtype(dtype_name if dtype_name is not None else array.dtype)
+        named_dtype = getattr(actual, "name", None)
+        if isinstance(named_dtype, str):
+            named_dtype = named_dtype.lower()
+        candidates = (getattr(actual, "as_numpy_dtype", None), named_dtype,
+                      actual, str(actual).rsplit(".", 1)[-1].lower())
+        for candidate in candidates:
+            if candidate is None:
+                continue
             try:
-                matches = np.dtype(actual) == np.dtype(dtype_name)
-            except TypeError:
-                matches = False
-            if not matches:
-                raise ValueError(f"{self.root} changed {dtype_name} to {actual}")
-        return out
+                observed = np.dtype(candidate)
+            except (TypeError, ValueError):
+                continue
+            if observed != expected:
+                raise ValueError(f"{self.root} changed {expected.name} to {actual}")
+            return out
+        raise TypeError(f"{self.root} exposed an unrecognized dtype: {actual}")

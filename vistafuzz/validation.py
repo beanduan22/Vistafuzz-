@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from .collector import ApiRecord, receiver_record, signature_params
+from .collector import ApiRecord, has_runtime_signature, receiver_record, signature_params
 from .models import ApiSpec, ParamSpec, SUPPORTED_RELATIONSHIPS
 from .relationships import dependency_order
 
@@ -74,9 +74,13 @@ def _validate_receiver(spec: ApiSpec, record: ApiRecord) -> str:
     return ""
 
 
-def validate(spec: ApiSpec, record: ApiRecord) -> ValidationResult:
+def validate(spec: ApiSpec, record: ApiRecord, *, signature_policy: str = "runtime") -> ValidationResult:
+    if signature_policy not in ("runtime", "documented"):
+        raise ValueError(f"unknown signature policy: {signature_policy}")
     if not record.doc.strip():
         return ValidationResult(None, False, "no usable documentation")
+    if signature_policy == "runtime" and not has_runtime_signature(record):
+        return ValidationResult(None, False, "no usable runtime signature; documentation is not an independent signature")
     if len({p.name for p in spec.params}) != len(spec.params):
         return ValidationResult(None, False, "duplicate parameter names in extraction")
     if spec.is_method:

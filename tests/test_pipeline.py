@@ -338,7 +338,8 @@ def test_generated_reproducer_runs(tmp_path):
     from vistafuzz.runner import RunConfig, run
     out = tmp_path / "run"
     run(RunConfig(lib="numpy", out_dir=str(out), budget_sec=4.0, case_timeout=5,
-                  extractor="signature", apis=["numpy.log", "numpy.divide"]))
+                  extractor="signature", signature_policy="documented",
+                  apis=["numpy.log", "numpy.divide"]))
     repro_dir = out / "reproducers"
     scripts = sorted(repro_dir.glob("*.py")) if repro_dir.exists() else []
     if not scripts:

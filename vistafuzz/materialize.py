@@ -4,7 +4,7 @@ from typing import Any
 
 import numpy as np
 
-from .adapters import get_adapter
+from .native import get_runtime
 from .models import CALL_KEYWORD, CALL_POSITIONAL, CALL_POSITIONAL_OR_KEYWORD, ParamSpec, Value
 
 def library_root(api: str) -> str:
@@ -12,11 +12,11 @@ def library_root(api: str) -> str:
 
 
 def native_dtype(root: str, name: str) -> Any:
-    return get_adapter(root).dtype(name)
+    return get_runtime(root).dtype(name)
 
 
 def to_native_array(root: str, arr: np.ndarray, dtype_name: str | None) -> Any:
-    return get_adapter(root).array(arr, dtype_name)
+    return get_runtime(root).array(arr, dtype_name)
 
 
 def materialize_value(root: str, value: Value) -> Any:

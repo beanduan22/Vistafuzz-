@@ -6,7 +6,7 @@ import os
 import sys
 
 from . import llm as llm_mod
-from .collector import collect, collect_api
+from .collector import collect, collect_api, has_runtime_signature
 from .extraction import extract
 from .generation import VARIANTS
 from .runner import RunConfig, run
@@ -32,6 +32,9 @@ def _add_llm_flags(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--llm-base-url", default="", help="OpenAI-compatible base URL")
     parser.add_argument("--spec-dir", default="", help="persistent extraction cache")
     parser.add_argument("--prompt-input", choices=["doc+sig", "doc-only", "sig-only"], default="doc+sig")
+    parser.add_argument("--signature-policy", choices=["runtime", "documented"], default="runtime",
+                        help="runtime: require independently introspectable calling information; "
+                             "documented: exploratory use of binding docstrings")
 
 
 def cmd_apis(args: argparse.Namespace) -> int:
@@ -50,9 +53,12 @@ def cmd_extract(args: argparse.Namespace) -> int:
     if record is None:
         print(f"cannot resolve {args.api}", file=sys.stderr)
         return 2
+    if args.signature_policy == "runtime" and not has_runtime_signature(record):
+        print(f"excluded {args.api}: no usable runtime signature", file=sys.stderr)
+        return 1
     spec = extract(record, extractor=args.extractor, config=_llm_config(args),
                    cache_dir=args.spec_dir, prompt_input=args.prompt_input)
-    result = validate(spec, record)
+    result = validate(spec, record, signature_policy=args.signature_policy)
     payload = {
         "validated": result.ok,
         "reason": result.reason,
@@ -106,6 +112,7 @@ def cmd_fuzz(args: argparse.Namespace) -> int:
         native_coverage=args.native_coverage,
         native_build_dir=args.native_build_dir,
         generator=args.generator,
+        signature_policy=args.signature_policy,
     )
     if not config.lib:
         print("either --lib or --api is required", file=sys.stderr)
@@ -140,6 +147,21 @@ def cmd_bugs(args):
     from .issue_stats import markdown, summarize
 
     print(markdown(summarize(args.file)))
+    return 0
+
+
+def cmd_triage(args):
+    from .triage import review_findings
+
+    summary = review_findings(args.findings, args.decisions, args.out)
+    print(json.dumps(summary, indent=2))
+    return 0
+
+
+def cmd_adaptation(args):
+    from .runtime_stats import measure
+
+    print(json.dumps(measure(), indent=2))
     return 0
 
 
@@ -226,6 +248,13 @@ def build_parser() -> argparse.ArgumentParser:
     bugs = sub.add_parser("bugs", help="summarize the issue ledger using the paper's columns")
     bugs.add_argument("--file", default="bug_review.csv")
     bugs.set_defaults(func=cmd_bugs)
+    triage = sub.add_parser("triage", help="record documentation-checked, minimized findings for reporting")
+    triage.add_argument("--findings", required=True, help="campaign findings.jsonl")
+    triage.add_argument("--decisions", required=True, help="manual review decisions in JSON")
+    triage.add_argument("--out", required=True)
+    triage.set_defaults(func=cmd_triage)
+    adaptation = sub.add_parser("adaptation", help="measure dedicated runtime source lines")
+    adaptation.set_defaults(func=cmd_adaptation)
     return parser
 
 

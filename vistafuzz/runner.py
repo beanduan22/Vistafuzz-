@@ -10,7 +10,7 @@ from typing import Any, Iterable
 
 from . import llm as llm_mod
 from . import coverage_support, direct, generation, reproducer
-from .collector import ApiRecord, collect, collect_api, signature_params
+from .collector import ApiRecord, collect, collect_api, has_runtime_signature, signature_params
 from .extraction import extract
 from .models import ApiSpec, Finding
 from .oracles import crash_verdict, is_resource_exhaustion
@@ -42,6 +42,7 @@ class RunConfig:
     native_coverage: str = ""
     native_build_dir: str = ""
     generator: str = "paramspec"
+    signature_policy: str = "runtime"
 
 
 @dataclass
@@ -116,6 +117,9 @@ def _finding(api: str, spec: ApiSpec, row: dict[str, Any]) -> Finding:
 
 
 def run_api(record: ApiRecord, config: RunConfig, work_dir: str) -> ApiOutcome:
+    if config.signature_policy == "runtime" and not has_runtime_signature(record):
+        return ApiOutcome(record.api, "excluded", "no usable runtime signature",
+                          signature_source=record.signature_source)
     zero_argument_method = (record.is_method and record.signature is not None
                             and all(name in ("self", "cls") for name in record.signature.parameters))
     if not record.doc.strip() or not signature_params(record) and not zero_argument_method:
@@ -129,7 +133,7 @@ def run_api(record: ApiRecord, config: RunConfig, work_dir: str) -> ApiOutcome:
         spec = extract(record, extractor=config.extractor, config=config.llm,
                        cache_dir=cache_dir, prompt_input=config.prompt_input)
     if config.generator != "llm-direct" and "validation" not in generation.VARIANTS[config.variant]:
-        result = validate(spec, record)
+        result = validate(spec, record, signature_policy=config.signature_policy)
         if not result.ok or result.spec is None:
             return ApiOutcome(record.api, "excluded", result.reason, extractor=spec.extractor,
                               preprocessing_sec=time.monotonic() - started)
@@ -220,6 +224,8 @@ def run_api(record: ApiRecord, config: RunConfig, work_dir: str) -> ApiOutcome:
 
 
 def run(config: RunConfig) -> dict[str, Any]:
+    if config.signature_policy not in ("runtime", "documented"):
+        raise ValueError(f"unknown signature policy: {config.signature_policy}")
     if config.variant not in generation.VARIANTS:
         raise ValueError(f"unknown variant: {config.variant}")
     os.makedirs(config.out_dir, exist_ok=True)
@@ -272,6 +278,7 @@ def run(config: RunConfig) -> dict[str, Any]:
         "variant": config.variant,
         "prompt_input": config.prompt_input,
         "generator": config.generator,
+        "signature_policy": config.signature_policy,
         "budget_sec_per_api": config.budget_sec,
         "apis_discovered": len(records),
         "apis_method_based": len([r for r in records if r.is_method]),

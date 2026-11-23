@@ -5,7 +5,8 @@ import json
 from dataclasses import asdict
 
 from . import oracles, synth
-from .adapters import base, get_adapter
+from . import native_base as base
+from .native import get_runtime
 from .models import Finding
 
 _RUNTIME = """
@@ -21,14 +22,10 @@ def _native(recipe, root):
     if form == "dict":
         return {k: _native(v, root) for k, v in recipe.get("items", {}).items()}
     if recipe.get("as_dtype"):
-        return ADAPTER.dtype(recipe["value"])
+        return RUNTIME.dtype(recipe["value"])
     value = build_value(recipe)
     if form in ("array", "literal_array"):
-        if root == "jax" and recipe.get("dtype") in ("float64", "complex128", "int64", "uint64"):
-            import jax
-
-            jax.config.update("jax_enable_x64", True)
-        return ADAPTER.array(value, recipe.get("dtype"))
+        return RUNTIME.array(value, recipe.get("dtype"))
     return value
 
 
@@ -87,7 +84,7 @@ def main():
     if ORACLE == "crash":
         print("no crash: call returned", type(result).__name__)
         return 0
-    flagged, detail = check_nan(result, list(positional) + list(keyword.values()), DOC)
+    flagged, detail = check_nan(result, list(positional) + list(keyword.values()), DOC, api=API)
     print(("BUG REPRODUCES: " if flagged else "OK: ") + detail)
     return int(flagged)
 
@@ -105,7 +102,11 @@ def _entries(order, args):
 def render(finding: Finding):
     sources = [inspect.getsource(module).replace("from __future__ import annotations\n", "")
                for module in (synth, oracles, base)]
-    adapter = asdict(get_adapter(finding.api))
+    runtime_instance = get_runtime(finding.api)
+    runtime = asdict(runtime_instance)
+    runtime_class = type(runtime_instance)
+    if runtime_class is not base.Runtime:
+        sources.append(inspect.getsource(runtime_class))
     constants = {
         "API": finding.api, "ARGS": _entries(finding.order, finding.args),
         "ORACLE": finding.oracle, "KIND": finding.kind, "DOC": finding.doc,
@@ -116,7 +117,7 @@ def render(finding: Finding):
     assignments = "\n".join(f"{name} = {value!r}" for name, value in constants.items())
     return ("\n".join(["from __future__ import annotations", "import sys",
                        'nan = float("nan")', 'inf = float("inf")', *sources])
-            + "\nADAPTER = Adapter(**" + repr(adapter) + ")\n"
+            + "\nRUNTIME = " + runtime_class.__name__ + "(**" + repr(runtime) + ")\n"
             + assignments + "\n" + _RUNTIME)
 
 

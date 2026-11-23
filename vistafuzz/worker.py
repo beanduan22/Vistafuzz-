@@ -319,7 +319,7 @@ def run_job(job: dict[str, Any]) -> int:
         elif status == "rejected":
             event["detail"] = detail
         else:
-            flagged, why = oracles.check_nan(result, native_inputs, spec.doc)
+            flagged, why = oracles.check_nan(result, native_inputs, spec.doc, api=api)
             if flagged:
                 oracle_hits += 1
                 event["detail"] = why

@@ -10,7 +10,7 @@ from typing import Any, Iterator
 
 from .models import (CALL_KEYWORD, CALL_POSITIONAL, CALL_POSITIONAL_OR_KEYWORD,
                      CALL_VAR_KEYWORD, CALL_VAR_POSITIONAL)
-from .native import canonical_library, get_runtime
+from .runtime import canonical_library, get_runtime
 
 _EXCLUDE_TOKENS = frozenset({
     "save", "load", "read", "write", "download", "fetch", "dump", "export",

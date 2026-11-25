@@ -266,7 +266,7 @@ def run_job(job: dict[str, Any]) -> int:
                    "receiver_args": receiver_described,
                    "n_positional": len(positional), "keywords": sorted(keyword)})
 
-        native_inputs = list(positional) + list(keyword.values())
+        call_inputs = list(positional) + list(keyword.values())
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             break
@@ -319,7 +319,7 @@ def run_job(job: dict[str, Any]) -> int:
         elif status == "rejected":
             event["detail"] = detail
         else:
-            flagged, why = oracles.check_nan(result, native_inputs, spec.doc, api=api)
+            flagged, why = oracles.check_nan(result, call_inputs, spec.doc, api=api)
             if flagged:
                 oracle_hits += 1
                 event["detail"] = why

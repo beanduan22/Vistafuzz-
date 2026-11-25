@@ -5,22 +5,22 @@ import json
 from dataclasses import asdict
 
 from . import oracles, synth
-from . import native_base as base
-from .native import get_runtime
+from . import runtime as base
+from .runtime import get_runtime
 from .models import Finding
 
 _RUNTIME = """
-def _native(recipe, root):
+def _materialize(recipe, root):
     form = recipe.get("form")
     if form == "receiver":
         values = recipe.get("args", {})
         entries = [dict(v, name=k) for k, v in values.items()]
         return _build_receiver(recipe["path"], entries, root)
     if form == "sequence":
-        items = [_native(item, root) for item in recipe.get("items", [])]
+        items = [_materialize(item, root) for item in recipe.get("items", [])]
         return tuple(items) if recipe.get("as_tuple") else items
     if form == "dict":
-        return {k: _native(v, root) for k, v in recipe.get("items", {}).items()}
+        return {k: _materialize(v, root) for k, v in recipe.get("items", {}).items()}
     if recipe.get("as_dtype"):
         return RUNTIME.dtype(recipe["value"])
     value = build_value(recipe)
@@ -34,7 +34,7 @@ def _build_args(entries, root):
     for entry in entries:
         if entry.get("omitted"):
             continue
-        value = _native(entry.get("recipe", {}), root)
+        value = _materialize(entry.get("recipe", {}), root)
         if entry.get("by_keyword"):
             keyword[entry["name"]] = value
         else:
@@ -99,9 +99,15 @@ def _entries(order, args):
             if name in args and not args[name].get("omitted")]
 
 
+_RUNTIME_HEADER = ("import importlib\nimport inspect\n"
+                   "from dataclasses import dataclass\nimport numpy as np\n\n")
+
+
 def render(finding: Finding):
     sources = [inspect.getsource(module).replace("from __future__ import annotations\n", "")
-               for module in (synth, oracles, base)]
+               for module in (synth, oracles)]
+    sources.append(_RUNTIME_HEADER + inspect.getsource(base.resolve_object)
+                   + "\n\n" + inspect.getsource(base.Runtime))
     runtime_instance = get_runtime(finding.api)
     runtime = asdict(runtime_instance)
     runtime_class = type(runtime_instance)

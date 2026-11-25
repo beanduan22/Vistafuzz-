@@ -4,18 +4,18 @@ from typing import Any
 
 import numpy as np
 
-from .native import get_runtime
+from .runtime import get_runtime
 from .models import CALL_KEYWORD, CALL_POSITIONAL, CALL_POSITIONAL_OR_KEYWORD, ParamSpec, Value
 
 def library_root(api: str) -> str:
     return api.split(".", 1)[0]
 
 
-def native_dtype(root: str, name: str) -> Any:
+def library_dtype(root: str, name: str) -> Any:
     return get_runtime(root).dtype(name)
 
 
-def to_native_array(root: str, arr: np.ndarray, dtype_name: str | None) -> Any:
+def to_library_array(root: str, arr: np.ndarray, dtype_name: str | None) -> Any:
     return get_runtime(root).array(arr, dtype_name)
 
 
@@ -24,10 +24,10 @@ def materialize_value(root: str, value: Value) -> Any:
         payload = value.payload
         if not isinstance(payload, np.ndarray):
             payload = np.asarray(payload)
-        return to_native_array(root, payload, value.dtype)
+        return to_library_array(root, payload, value.dtype)
     if value.kind == "dtype":
-        native = native_dtype(root, str(value.payload))
-        return native if native is not None else value.payload
+        built = library_dtype(root, str(value.payload))
+        return built if built is not None else value.payload
     if value.kind == "receiver":
         return value.payload
     if value.kind in ("shape",):
@@ -51,11 +51,11 @@ def materialize(api: str, specs: list[ParamSpec],
             if spec.call_kind in (CALL_POSITIONAL, CALL_POSITIONAL_OR_KEYWORD):
                 keyword_only_from_here = True
             continue
-        native = materialize_value(root, value)
+        built = materialize_value(root, value)
         if spec.call_kind == CALL_KEYWORD or keyword_only_from_here:
             if spec.call_kind == CALL_POSITIONAL:
                 continue
-            keyword[spec.name] = native
+            keyword[spec.name] = built
         else:
-            positional.append(native)
+            positional.append(built)
     return positional, keyword

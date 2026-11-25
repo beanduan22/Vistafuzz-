@@ -105,8 +105,8 @@ def _iter_numeric(obj: Any, depth: int = 0, include_bool: bool = False, _seen=No
             return
 
 
-def inputs_are_finite(natives: list[Any]) -> bool:
-    return all(np.all(np.isfinite(arr)) for item in natives for arr in _iter_numeric(item))
+def inputs_are_finite(values: list[Any]) -> bool:
+    return all(np.all(np.isfinite(arr)) for item in values for arr in _iter_numeric(item))
 
 
 def _nan_propagates(doc):

@@ -1,5 +1,3 @@
-"""Per-library runtimes: how VistaFuzz turns a generated NumPy value into each
-library's tensor type, reads its docs/signatures, and resolves dtypes."""
 from __future__ import annotations
 
 import importlib
@@ -88,7 +86,6 @@ class Runtime:
         raise TypeError(f"{self.root} exposed an unrecognized dtype: {actual}")
 
 
-# --- torch -----------------------------------------------------------------
 class TorchRuntime(Runtime):
     def signature(self, obj):
         signature = super().signature(obj)
@@ -126,7 +123,6 @@ class TorchRuntime(Runtime):
 _TORCH = TorchRuntime("torch", "torch.tensor", "torch")
 
 
-# --- tensorflow ------------------------------------------------------------
 class TensorFlowRuntime(Runtime):
     def documentation(self, obj):
         doc = super().documentation(obj)
@@ -167,7 +163,6 @@ class TensorFlowRuntime(Runtime):
 _TENSORFLOW = TensorFlowRuntime("tensorflow", "tensorflow.convert_to_tensor", "tensorflow")
 
 
-# --- jax -------------------------------------------------------------------
 class JaxRuntime(Runtime):
     def documentation(self, obj):
         doc = super().documentation(obj)
@@ -200,7 +195,6 @@ class JaxRuntime(Runtime):
 _JAX = JaxRuntime("jax", "jax.numpy.asarray", "jax.numpy")
 
 
-# --- keras -----------------------------------------------------------------
 class KerasRuntime(Runtime):
     def dtype(self, name):
         import keras
@@ -246,7 +240,6 @@ class KerasRuntime(Runtime):
 _KERAS = KerasRuntime("keras", "keras.ops.convert_to_tensor", dtype_as_string=True)
 
 
-# --- paddle ----------------------------------------------------------------
 class PaddleRuntime(Runtime):
     def array(self, value, dtype_name):
         import numpy as np
@@ -270,7 +263,6 @@ class PaddleRuntime(Runtime):
 _PADDLE = PaddleRuntime("paddle", "paddle.to_tensor", "paddle")
 
 
-# --- oneflow ---------------------------------------------------------------
 class OneFlowRuntime(Runtime):
     def array(self, value, dtype_name):
         import numpy as np
@@ -287,7 +279,6 @@ class OneFlowRuntime(Runtime):
 _ONEFLOW = OneFlowRuntime("oneflow", "oneflow.tensor", "oneflow")
 
 
-# --- mindspore -------------------------------------------------------------
 class MindSporeRuntime(Runtime):
     def dtype(self, name):
         from mindspore import dtype as mstype
@@ -311,7 +302,6 @@ class MindSporeRuntime(Runtime):
 _MINDSPORE = MindSporeRuntime("mindspore", "mindspore.Tensor", "mindspore")
 
 
-# --- chainer ---------------------------------------------------------------
 class ChainerRuntime(Runtime):
     def array(self, value, dtype_name):
         import chainer
@@ -326,15 +316,12 @@ class ChainerRuntime(Runtime):
 _CHAINER = ChainerRuntime("chainer", "chainer.Variable", accepts_dtype=False)
 
 
-# --- numpy -----------------------------------------------------------------
 _NUMPY = Runtime("numpy", "numpy.asarray")
 
 
-# --- scipy -----------------------------------------------------------------
 _SCIPY = Runtime("scipy", "numpy.asarray")
 
 
-# --- sklearn ---------------------------------------------------------------
 class SklearnRuntime(Runtime):
     def array(self, value, dtype_name):
         import numpy as np
@@ -347,7 +334,6 @@ class SklearnRuntime(Runtime):
 _SKLEARN = SklearnRuntime("sklearn", "numpy.asarray")
 
 
-# --- cv2 -------------------------------------------------------------------
 class OpenCVRuntime(Runtime):
     def array(self, value, dtype_name):
         import numpy as np
